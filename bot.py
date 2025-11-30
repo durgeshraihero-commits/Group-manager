@@ -137,6 +137,7 @@ async def premium_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("📅 Weekly - ₹300", callback_data="buy_week")],
         [InlineKeyboardButton("📆 Monthly - ₹500", callback_data="buy_month")],
+        [InlineKeyboardButton("💬 Contact Admin", url=f"https://t.me/{ADMIN_USERNAME}")],
     ]
     
     if is_premium(user_id):
@@ -223,7 +224,10 @@ async def handle_plan_selection(update: Update, context: ContextTypes.DEFAULT_TY
         f"• Bank Transfer\n"
         f"• PayTM\n\n"
         f"⏳ After payment, wait for admin confirmation.\n"
-        f"You'll be notified once approved!"
+        f"You'll be notified once approved!",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("💬 Contact Admin", url=f"https://t.me/{ADMIN_USERNAME}")
+        ]])
     )
 
 async def handle_payment_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -385,6 +389,29 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 def main():
     """Start the bot"""
+    # For Render.com and other platforms - set up a simple HTTP server
+    import os
+    from threading import Thread
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    
+    class HealthCheckHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'Bot is running!')
+        
+        def log_message(self, format, *args):
+            pass  # Suppress logs
+    
+    # Start health check server on PORT (for Render.com)
+    port = int(os.environ.get('PORT', 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    health_thread = Thread(target=server.serve_forever, daemon=True)
+    health_thread.start()
+    logger.info(f"Health check server started on port {port}")
+    
+    # Start the bot
     application = Application.builder().token(BOT_TOKEN).build()
     
     # Command handlers
