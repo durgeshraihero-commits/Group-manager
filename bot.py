@@ -20,7 +20,49 @@ PREMIUM_PLANS = {
 # Storage (in production, use a database)
 user_messages = defaultdict(lambda: {
     "count": 0, 
-    "date": None,
+    "date": def main():
+    """Start the bot"""
+    # For Render.com and other platforms - set up a simple HTTP server
+    import os
+    from threading import Thread
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    
+    class HealthCheckHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'Bot is running!')
+        
+        def log_message(self, format, *args):
+            pass  # Suppress logs
+    
+    # Start health check server on PORT (for Render.com)
+    port = int(os.environ.get('PORT', 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    health_thread = Thread(target=server.serve_forever, daemon=True)
+    health_thread.start()
+    logger.info(f"Health check server started on port {port}")
+    
+    # Start the bot
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Command handlers MUST come FIRST - ORDER IS CRITICAL!
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("premium", premium_menu))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("test", test_command))
+    
+    # Callback handlers
+    application.add_handler(CallbackQueryHandler(handle_plan_selection, pattern="^buy_"))
+    application.add_handler(CallbackQueryHandler(handle_payment_confirmation, pattern="^(confirm|reject)_"))
+    
+    # Message handler MUST come LAST - catches everything else
+    application.add_handler(MessageHandler(
+        filters.ALL,
+        handle_group_message
+    )),
     "is_new_user": True,
     "joined_date": datetime.now()
 })
@@ -313,12 +355,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show help message"""
     await update.message.reply_text(
         f"📚 BOT HELP\n\n"
+        f"🔍 Message Counting:\n"
+        f"• Only messages starting with / are counted\n"
+        f"• Examples: /num, /search, /find, etc.\n"
+        f"• Regular chat messages are NOT counted\n\n"
         f"🆓 Free Members:\n"
-        f"• New Users: {NEW_USER_MESSAGE_LIMIT} messages (first day only)\n"
-        f"• Regular Users: {DAILY_MESSAGE_LIMIT} message per day\n"
+        f"• New Users: {NEW_USER_MESSAGE_LIMIT} searches (first day only)\n"
+        f"• Regular Users: {DAILY_MESSAGE_LIMIT} search per day\n"
         f"• Resets daily at midnight\n\n"
         f"💎 Premium Members:\n"
-        f"• Unlimited messages\n"
+        f"• Unlimited searches\n"
         f"• No restrictions\n\n"
         f"💰 Premium Plans:\n"
         f"• Weekly: ₹300 (7 days)\n"
@@ -327,9 +373,70 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"/start - Start bot\n"
         f"/status - Check account\n"
         f"/premium - Buy premium\n"
-        f"/help - This message\n\n"
+        f"/help - This message\n"
+        f"/test - Test bot in group\n\n"
         f"Need help? Contact @{ADMIN_USERNAME}"
     )
+
+async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Test if bot is working in the group"""
+    logger.info(f"TEST COMMAND RECEIVED from {update.effective_user.username}")
+    
+    chat_type = update.effective_chat.type
+    user_id = update.effective_user.id
+    user_name = update.effective_user.username or update.effective_user.first_name
+    
+    logger.info(f"Chat type: {chat_type}, User: {user_name}, User ID: {user_id}")
+    
+    # Check if in group
+    if chat_type in ["group", "supergroup"]:
+        # Check bot admin status
+        try:
+            bot_member = await context.bot.get_chat_member(update.effective_chat.id, context.bot.id)
+            bot_status = bot_member.status
+            logger.info(f"Bot status in group: {bot_status}")
+            
+            if bot_status in ["administrator", "creator"]:
+                admin_status = "✅ Bot is Admin (Can delete messages)"
+            else:
+                admin_status = "❌ Bot is NOT Admin (Cannot delete messages)\n⚠️ Make bot admin with 'Delete Messages' permission!"
+        except Exception as e:
+            admin_status = f"❌ Error checking status: {e}"
+            logger.error(f"Error checking bot admin status: {e}")
+        
+        # Check user status
+        is_new = user_messages[user_id]["is_new_user"]
+        limit = get_user_message_limit(user_id)
+        
+        response_text = (
+            f"🤖 BOT STATUS TEST\n\n"
+            f"Chat Type: {chat_type}\n"
+            f"{admin_status}\n\n"
+            f"👤 Your Status:\n"
+            f"User: @{user_name}\n"
+            f"Type: {'🎁 New User' if is_new else '🆓 Regular User'}\n"
+            f"Daily Limit: {limit} message(s)\n"
+            f"Premium: {'✅ Yes' if is_premium(user_id) else '❌ No'}\n\n"
+            f"✅ Bot is working in this group!\n\n"
+            f"🔍 Debug Info:\n"
+            f"Privacy Mode must be: DISABLED\n"
+            f"Bot sees all messages: YES"
+        )
+        
+        logger.info(f"Sending test response to group")
+        await update.message.reply_text(response_text)
+        logger.info(f"Test response sent successfully")
+    else:
+        logger.info(f"Test command in private chat")
+        await update.message.reply_text(
+            f"🤖 BOT TEST\n\n"
+            f"Chat Type: {chat_type} (Private Chat)\n\n"
+            f"ℹ️ To test in group:\n"
+            f"1. Add me to your group\n"
+            f"2. Make me admin with 'Delete Messages' permission\n"
+            f"3. Use /test in the group"
+        )
+
 
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle messages in the group"""
@@ -508,14 +615,16 @@ def main():
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("premium", premium_menu))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("test", test_command))
     
     # Callback handlers
     application.add_handler(CallbackQueryHandler(handle_plan_selection, pattern="^buy_"))
     application.add_handler(CallbackQueryHandler(handle_payment_confirmation, pattern="^(confirm|reject)_"))
     
     # Message handler for group messages (both group and supergroup)
+    # Use a simpler filter to catch ALL messages first
     application.add_handler(MessageHandler(
-        (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP) & ~filters.COMMAND,
+        filters.ALL,
         handle_group_message
     ))
     
