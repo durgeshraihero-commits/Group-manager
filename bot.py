@@ -334,57 +334,156 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type not in ["group", "supergroup"]:
-        return
-    if not update.message or not update.message.text:
-        return
-    user_id = update.effective_user.id
-    username = update.effective_user.username
-    first_name = update.effective_user.first_name
-    message_text = update.message.text.strip()
-    if not message_text.startswith('/'):
-        return
-    command = message_text.split()[0].lower()
-    if command in ['/start', '/status', '/premium', '/help', '/approve', '/database']:
-        return
-    if user_id == ADMIN_USER_ID:
-        return
     try:
-        bot_member = await context.bot.get_chat_member(update.effective_chat.id, context.bot.id)
-        if bot_member.status not in ["administrator", "creator"]:
+        logger.info(f"=== MESSAGE RECEIVED ===")
+        logger.info(f"Chat type: {update.effective_chat.type if update.effective_chat else 'None'}")
+        logger.info(f"Message: {update.message.text if update.message else 'None'}")
+        
+        if update.effective_chat.type not in ["group", "supergroup"]:
+            logger.info("Not a group message, ignoring")
             return
-    except:
-        return
-    user = await get_or_create_user(user_id, username, first_name)
-    await update_user_info(user_id, username, first_name)
-    await log_command(user_id, username, command, update.effective_chat.id)
-    if await is_premium(user_id):
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"💎 @{username or first_name}: Premium - Unlimited!", reply_to_message_id=update.message.message_id)
-        return
-    await reset_daily_count(user_id)
-    user = await users_collection.find_one({'user_id': user_id})
-    limit = await get_user_message_limit(user_id)
-    count = user.get('message_count', 0)
-    if count >= limit:
-        is_new = user.get('is_new_user', False)
-        midnight = get_midnight_kolkata()
+        
+        if not update.message or not update.message.text:
+            logger.info("No message text, ignoring")
+            return
+        
+        user_id = update.effective_user.id
+        username = update.effective_user.username
+        first_name = update.effective_user.first_name
+        message_text = update.message.text.strip()
+        
+        logger.info(f"User: {user_id} (@{username})")
+        logger.info(f"Message text: {message_text}")
+        
+        if not message_text.startswith('/'):
+            logger.info("Not a command, ignoring")
+            return
+        
+        command = message_text.split()[0].lower()
+        logger.info(f"Command extracted: {command}")
+        
+        if command in ['/start', '/status', '/premium', '/help', '/approve', '/database']:
+            logger.info(f"Bot management command, ignoring")
+            return
+        
+        if user_id == ADMIN_USER_ID:
+            logger.info("Admin user, unlimited access")
+            return
+        
+        # Check if bot is admin
         try:
-            await update.message.delete()
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=f"⛔ @{username or first_name} - BLOCKED\n\nUsed {limit}/{limit} {'🎁 ' if is_new else ''}today\nResets: {midnight.strftime('%H:%M')} IST\n\n/premium")
-        except:
-            pass
-        return
-    await users_collection.update_one({'user_id': user_id}, {'$inc': {'message_count': 1}})
-    remaining = limit - (count + 1)
-    is_new = user.get('is_new_user', False)
-    try:
-        if remaining > 0:
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=f"📊 @{username or first_name}: {remaining}/{limit} left{' 🎁' if is_new else ''}", reply_to_message_id=update.message.message_id)
-        else:
+            bot_member = await context.bot.get_chat_member(update.effective_chat.id, context.bot.id)
+            logger.info(f"Bot status: {bot_member.status}")
+            if bot_member.status not in ["administrator", "creator"]:
+                logger.warning("Bot is not admin!")
+                return
+        except Exception as e:
+            logger.error(f"Error checking bot status: {e}")
+            return
+        
+        # Get or create user
+        logger.info("Getting/creating user...")
+        user = await get_or_create_user(user_id, username, first_name)
+        await update_user_info(user_id, username, first_name)
+        
+        # Log command
+        logger.info("Logging command to database...")
+        await log_command(user_id, username, command, update.effective_chat.id)
+        logger.info("Command logged successfully!")
+        
+        # Check premium
+        is_premium_user = await is_premium(user_id)
+        logger.info(f"Premium status: {is_premium_user}")
+        
+        if is_premium_user:
+            logger.info("User is premium, sending premium message")
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"💎 @{username or first_name}: Premium Member - Unlimited searches!",
+                reply_to_message_id=update.message.message_id
+            )
+            logger.info("Premium message sent!")
+            return
+        
+        # Reset daily count
+        logger.info("Resetting daily count if needed...")
+        await reset_daily_count(user_id)
+        
+        # Get fresh user data
+        logger.info("Getting fresh user data...")
+        user = await users_collection.find_one({'user_id': user_id})
+        limit = await get_user_message_limit(user_id)
+        count = user.get('message_count', 0)
+        
+        logger.info(f"User count: {count}/{limit}")
+        
+        # Check if limit exceeded
+        if count >= limit:
+            logger.info("LIMIT EXCEEDED! Deleting message and sending block notification")
+            is_new = user.get('is_new_user', False)
             midnight = get_midnight_kolkata()
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=f"⚠️ @{username or first_name}: Last search!\nNext blocked until {midnight.strftime('%H:%M')} IST\n\n/premium", reply_to_message_id=update.message.message_id)
-    except:
-        pass
+            
+            try:
+                # Delete user's command
+                await update.message.delete()
+                logger.info("User message deleted")
+                
+                # Send block notification
+                block_msg = await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=f"⛔ @{username or first_name} - BLOCKED UNTIL MIDNIGHT\n\n"
+                         f"You've used {limit}/{limit} {'welcome bonus ' if is_new else ''}searches today.\n"
+                         f"You cannot send ANY commands until midnight.\n\n"
+                         f"🕐 Resets at: {midnight.strftime('%H:%M')} IST\n\n"
+                         f"💎 Upgrade to Premium for unlimited searches!\n"
+                         f"Use /premium to upgrade now!"
+                )
+                logger.info("Block notification sent!")
+            except Exception as e:
+                logger.error(f"Error blocking user: {e}")
+            return
+        
+        # Increment count
+        logger.info("Incrementing message count...")
+        await users_collection.update_one(
+            {'user_id': user_id},
+            {'$inc': {'message_count': 1}}
+        )
+        logger.info("Count incremented!")
+        
+        remaining = limit - (count + 1)
+        is_new = user.get('is_new_user', False)
+        
+        logger.info(f"Remaining: {remaining}")
+        
+        try:
+            if remaining > 0:
+                # Send status message
+                logger.info("Sending status message...")
+                status_msg = await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=f"📊 @{username or first_name}: {remaining}/{limit} search{'es' if remaining != 1 else ''} remaining today{' 🎁' if is_new else ''}",
+                    reply_to_message_id=update.message.message_id
+                )
+                logger.info("Status message sent!")
+            else:
+                # Last message warning
+                logger.info("Sending last message warning...")
+                midnight = get_midnight_kolkata()
+                warning_msg = await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=f"⚠️ @{username or first_name}: This was your last search for today!\n"
+                         f"Next command will be blocked until {midnight.strftime('%H:%M')} IST.\n"
+                         f"💎 Upgrade to Premium: /premium",
+                    reply_to_message_id=update.message.message_id
+                )
+                logger.info("Warning message sent!")
+        except Exception as e:
+            logger.error(f"Error sending status: {e}")
+    except Exception as e:
+        logger.error(f"CRITICAL ERROR in handle_group_message: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
 
 def main():
     import asyncio
