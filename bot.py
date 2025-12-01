@@ -1,14 +1,34 @@
+# bot.py
 import logging
 import os
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
-from datetime import datetime, timedelta
-from motor.motor_asyncio import AsyncIOMotorClient
-import pytz
 import json
 import io
+import asyncio
+from datetime import datetime, timedelta
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from threading import Thread
 
-# Configuration
+import pytz
+from motor.motor_asyncio import AsyncIOMotorClient
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ChatMemberAdministrator,
+    ChatMemberOwner,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+    ContextTypes,
+)
+
+# -----------------------
+# Configuration (env)
+# -----------------------
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '8597564579:AAGHr1Rqi8ZIqD_RA8PuslB1ob6bAjtOEhU')
 MONGODB_URI = os.environ.get('MONGODB_URI', 'mongodb+srv://prarthanaray147_db_user:fMuTkgFsaHa5NRIy@cluster0.txn8bv3.mongodb.net/tg_bot_db?retryWrites=true&w=majority')
 MONGODB_DBNAME = os.environ.get('MONGODB_DBNAME', 'tg_bot_db')
@@ -16,6 +36,7 @@ ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', 'itsmezigzagzozo')
 ADMIN_USER_ID = int(os.environ.get('ADMIN_USER_ID', '6314556756'))
 DAILY_MESSAGE_LIMIT = int(os.environ.get('DAILY_MESSAGE_LIMIT', '1'))
 NEW_USER_MESSAGE_LIMIT = int(os.environ.get('NEW_USER_MESSAGE_LIMIT', '5'))
+PORT = int(os.environ.get('PORT', '10000'))
 
 KOLKATA_TZ = pytz.timezone('Asia/Kolkata')
 
@@ -24,15 +45,24 @@ PREMIUM_PLANS = {
     "month": {"price": 500, "duration_days": 30, "name": "Monthly"}
 }
 
+# -----------------------
+# Globals
+# -----------------------
 mongo_client = None
 db = None
 users_collection = None
 commands_collection = None
-pending_payments = {}
+pending_payments = {}  # in-memory pending payment store (simple)
 
+# -----------------------
+# Logging
+# -----------------------
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# -----------------------
+# MongoDB init
+# -----------------------
 async def init_mongodb():
     global mongo_client, db, users_collection, commands_collection
     try:
@@ -40,6 +70,7 @@ async def init_mongodb():
         db = mongo_client[MONGODB_DBNAME]
         users_collection = db['users']
         commands_collection = db['commands']
+        # Indexes - create if not exists
         await users_collection.create_index('user_id', unique=True)
         await commands_collection.create_index([('user_id', 1), ('timestamp', -1)])
         logger.info("✅ MongoDB connected!")
@@ -47,6 +78,9 @@ async def init_mongodb():
         logger.error(f"❌ MongoDB error: {e}")
         raise
 
+# -----------------------
+# Time helpers
+# -----------------------
 def get_kolkata_time():
     return datetime.now(KOLKATA_TZ)
 
@@ -55,6 +89,9 @@ def get_midnight_kolkata():
     midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     return midnight
 
+# -----------------------
+# User helpers (DB)
+# -----------------------
 async def get_or_create_user(user_id, username, first_name):
     user = await users_collection.find_one({'user_id': user_id})
     if not user:
@@ -72,17 +109,20 @@ async def get_or_create_user(user_id, username, first_name):
             'total_commands': 0
         }
         await users_collection.insert_one(user)
-        logger.info(f"New user: {user_id}")
+        logger.info(f"New user created: {user_id}")
     return user
 
 async def update_user_info(user_id, username, first_name):
     await users_collection.update_one({'user_id': user_id}, {'$set': {'username': username, 'first_name': first_name}})
 
 async def log_command(user_id, username, command, chat_id):
-    await commands_collection.insert_one({'user_id': user_id, 'username': username, 'command': command, 'timestamp': get_kolkata_time(), 'chat_id': chat_id})
-    await users_collection.update_one({'user_id': user_id}, {'$inc': {'total_commands': 1}})
+    try:
+        await commands_collection.insert_one({'user_id': user_id, 'username': username, 'command': command, 'timestamp': get_kolkata_time(), 'chat_id': chat_id})
+        await users_collection.update_one({'user_id': user_id}, {'$inc': {'total_commands': 1}})
+    except Exception as e:
+        logger.error(f"Failed to log command: {e}")
 
-async def reset_daily_count(user_id):
+async def reset_daily_count_if_needed(user_id):
     user = await users_collection.find_one({'user_id': user_id})
     if not user:
         return
@@ -92,15 +132,31 @@ async def reset_daily_count(user_id):
 
 async def is_premium(user_id):
     user = await users_collection.find_one({'user_id': user_id})
-    if not user or not user.get('current_premium'):
+    if not user:
         return False
-    premium = user['current_premium']
+    premium = user.get('current_premium')
+    if not premium:
+        return False
     expires = premium.get('expires')
-    if expires and isinstance(expires, datetime):
-        if get_kolkata_time() < expires.replace(tzinfo=KOLKATA_TZ):
+    if expires:
+        # If stored as datetime -> compare; if string, try parse
+        if isinstance(expires, str):
+            try:
+                expires_dt = datetime.fromisoformat(expires)
+            except Exception:
+                return False
+        else:
+            expires_dt = expires
+        # ensure timezone awareness
+        if expires_dt.tzinfo is None:
+            # treat as kolkata tz
+            expires_dt = KOLKATA_TZ.localize(expires_dt)
+        if get_kolkata_time() < expires_dt:
             return True
         else:
+            # expired -> clear
             await users_collection.update_one({'user_id': user_id}, {'$set': {'current_premium': None}})
+            return False
     return False
 
 async def get_user_message_limit(user_id):
@@ -111,6 +167,9 @@ async def get_user_message_limit(user_id):
         return NEW_USER_MESSAGE_LIMIT
     return DAILY_MESSAGE_LIMIT
 
+# -----------------------
+# Command handlers
+# -----------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     username = update.effective_user.username
@@ -133,37 +192,41 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = update.effective_user.username
     first_name = update.effective_user.first_name
     user = await get_or_create_user(user_id, username, first_name)
-    await reset_daily_count(user_id)
+    await reset_daily_count_if_needed(user_id)
     user = await users_collection.find_one({'user_id': user_id})
     if await is_premium(user_id):
         premium = user.get('current_premium', {})
         expires = premium.get('expires')
         plan = premium.get('plan', 'custom')
         if expires:
-            expires_kolkata = expires.replace(tzinfo=KOLKATA_TZ)
-            days_left = (expires_kolkata - get_kolkata_time()).days
-            await update.message.reply_text(
-                f"💎 PREMIUM\n\n"
-                f"Plan: {PREMIUM_PLANS.get(plan, {}).get('name', 'Custom')}\n"
-                f"Expires: {expires_kolkata.strftime('%Y-%m-%d %H:%M')} IST\n"
-                f"Days: {days_left}\n"
-                f"Commands: {user.get('total_commands', 0)}\n\n"
-                f"/premium to renew"
-            )
-    else:
-        count = user.get('message_count', 0)
-        limit = await get_user_message_limit(user_id)
-        remaining = limit - count
-        user_type = "NEW 🎁" if user.get('is_new_user') else "FREE"
-        midnight = get_midnight_kolkata()
-        await update.message.reply_text(
-            f"🆓 {user_type}\n\n"
-            f"Used: {count}/{limit}\n"
-            f"Remaining: {remaining}\n"
-            f"Resets: {midnight.strftime('%H:%M')} IST\n"
-            f"Commands: {user.get('total_commands', 0)}\n\n"
-            f"/premium to upgrade"
-        )
+            expires_kolkata = expires if isinstance(expires, datetime) else (datetime.fromisoformat(expires) if isinstance(expires, str) else None)
+            if expires_kolkata and expires_kolkata.tzinfo is None:
+                expires_kolkata = KOLKATA_TZ.localize(expires_kolkata)
+            if expires_kolkata:
+                days_left = (expires_kolkata - get_kolkata_time()).days
+                await update.message.reply_text(
+                    f"💎 PREMIUM\n\n"
+                    f"Plan: {PREMIUM_PLANS.get(plan, {}).get('name', 'Custom')}\n"
+                    f"Expires: {expires_kolkata.strftime('%Y-%m-%d %H:%M')} IST\n"
+                    f"Days: {days_left}\n"
+                    f"Commands: {user.get('total_commands', 0)}\n\n"
+                    f"/premium to renew"
+                )
+                return
+    # Not premium
+    count = user.get('message_count', 0)
+    limit = await get_user_message_limit(user_id)
+    remaining = limit - count
+    user_type = "NEW 🎁" if user.get('is_new_user') else "FREE"
+    midnight = get_midnight_kolkata()
+    await update.message.reply_text(
+        f"🆓 {user_type}\n\n"
+        f"Used: {count}/{limit}\n"
+        f"Remaining: {remaining}\n"
+        f"Resets: {midnight.strftime('%H:%M')} IST\n"
+        f"Commands: {user.get('total_commands', 0)}\n\n"
+        f"/premium to upgrade"
+    )
 
 async def premium_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -178,7 +241,7 @@ async def premium_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         premium = user.get('current_premium', {})
         expires = premium.get('expires')
         if expires:
-            days_left = (expires.replace(tzinfo=KOLKATA_TZ) - get_kolkata_time()).days
+            days_left = (expires.replace(tzinfo=KOLKATA_TZ) - get_kolkata_time()).days if isinstance(expires, datetime) else 0
             status_text = f"✅ Premium! Expires in {days_left} days\n\n"
     await update.message.reply_text(
         f"{status_text}📅 Weekly: ₹300 (7 days)\n📆 Monthly: ₹500 (30 days)",
@@ -195,16 +258,19 @@ async def handle_plan_selection(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("❌ Invalid plan")
         return
     plan_info = PREMIUM_PLANS[plan]
-    payment_id = f"{user_id}_{plan}_{datetime.now().timestamp()}"
-    pending_payments[payment_id] = {"user_id": user_id, "user_name": user_name, "plan": plan, "amount": plan_info["price"], "timestamp": get_kolkata_time()}
+    payment_id = f"{user_id}_{plan}_{datetime.utcnow().timestamp()}"
+    pending_payments[payment_id] = {"user_id": user_id, "user_name": user_name, "plan": plan, "amount": plan_info["price"], "timestamp": get_kolkata_time().isoformat()}
     admin_keyboard = [[InlineKeyboardButton("✅ Confirm", callback_data=f"confirm_{payment_id}"), InlineKeyboardButton("❌ Reject", callback_data=f"reject_{payment_id}")]]
     try:
+        # send payment request to admin (by username or id)
+        admin_target = ADMIN_USER_ID if ADMIN_USER_ID else f"@{ADMIN_USERNAME}"
         await context.bot.send_message(
-            chat_id=ADMIN_USERNAME,
+            chat_id=admin_target,
             text=f"💰 Payment Request\n\nUser: @{user_name}\nID: {user_id}\nPlan: {plan_info['name']}\nAmount: ₹{plan_info['price']}",
             reply_markup=InlineKeyboardMarkup(admin_keyboard)
         )
-    except:
+    except Exception as e:
+        logger.error(f"Failed to notify admin of payment: {e}")
         await query.edit_message_text("❌ Error. Contact admin.")
         return
     await query.edit_message_text(
@@ -215,13 +281,14 @@ async def handle_plan_selection(update: Update, context: ContextTypes.DEFAULT_TY
 async def handle_payment_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    # Only admin can confirm
     if query.from_user.id != ADMIN_USER_ID:
         await query.answer("⛔ Admin only", show_alert=True)
         return
     data = query.data
     action, payment_id = data.split("_", 1)
     if payment_id not in pending_payments:
-        await query.edit_message_text("❌ Expired")
+        await query.edit_message_text("❌ Expired or invalid")
         return
     payment_info = pending_payments[payment_id]
     user_id = payment_info["user_id"]
@@ -232,17 +299,17 @@ async def handle_payment_confirmation(update: Update, context: ContextTypes.DEFA
         duration_days = PREMIUM_PLANS[plan]["duration_days"]
         expires = get_kolkata_time() + timedelta(days=duration_days)
         premium_record = {'plan': plan, 'expires': expires, 'activated': get_kolkata_time(), 'amount': amount, 'duration_days': duration_days}
-        await users_collection.update_one({'user_id': user_id}, {'$set': {'current_premium': premium_record}, '$push': {'premium_history': premium_record}})
+        await users_collection.update_one({'user_id': user_id}, {'$set': {'current_premium': premium_record}, '$push': {'premium_history': premium_record}}, upsert=True)
         await query.edit_message_text(f"✅ CONFIRMED\n\nUser: @{user_name}\nPlan: {PREMIUM_PLANS[plan]['name']}\nAmount: ₹{amount}")
         try:
             await context.bot.send_message(chat_id=user_id, text=f"🎉 PREMIUM ACTIVATED!\n\nPlan: {PREMIUM_PLANS[plan]['name']}\nDuration: {duration_days} days\n\n/status")
-        except:
+        except Exception:
             pass
     else:
         await query.edit_message_text(f"❌ REJECTED\n\nUser: @{user_name}")
         try:
             await context.bot.send_message(chat_id=user_id, text=f"❌ Payment rejected\n\nContact @{ADMIN_USERNAME}")
-        except:
+        except Exception:
             pass
     del pending_payments[payment_id]
 
@@ -270,7 +337,7 @@ async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ APPROVED\n\nID: {target_user_id}\nDays: {days}")
         try:
             await context.bot.send_message(chat_id=target_user_id, text=f"🎉 PREMIUM by ADMIN!\n\nDays: {days}\n\n/status")
-        except:
+        except Exception:
             await update.message.reply_text("⚠️ Couldn't notify user")
     except ValueError:
         await update.message.reply_text("❌ Invalid input")
@@ -333,162 +400,170 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Contact: @{ADMIN_USERNAME}"
     )
 
+# -----------------------
+# Group message handler (core logic)
+# -----------------------
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        logger.info(f"=== MESSAGE RECEIVED ===")
-        logger.info(f"Chat type: {update.effective_chat.type if update.effective_chat else 'None'}")
+        logger.info("=== MESSAGE RECEIVED ===")
+        chat_type = update.effective_chat.type if update.effective_chat else 'unknown'
+        logger.info(f"Chat type: {chat_type}")
         logger.info(f"Message: {update.message.text if update.message else 'None'}")
-        
-        if update.effective_chat.type not in ["group", "supergroup"]:
+
+        # Only process group/supergroup messages for counting
+        if chat_type not in ["group", "supergroup"]:
             logger.info("Not a group message, ignoring")
             return
-        
+
         if not update.message or not update.message.text:
             logger.info("No message text, ignoring")
             return
-        
+
         user_id = update.effective_user.id
-        username = update.effective_user.username
+        username = update.effective_user.username or update.effective_user.first_name
         first_name = update.effective_user.first_name
         message_text = update.message.text.strip()
-        
+
         logger.info(f"User: {user_id} (@{username})")
         logger.info(f"Message text: {message_text}")
-        
+
         if not message_text.startswith('/'):
             logger.info("Not a command, ignoring")
             return
-        
+
         command = message_text.split()[0].lower()
         logger.info(f"Command extracted: {command}")
-        
+
+        # Ignore bot management commands that should not be counted in groups
         if command in ['/start', '/status', '/premium', '/help', '/approve', '/database']:
-            logger.info(f"Bot management command, ignoring")
+            logger.info("Bot management command, ignoring")
             return
-        
+
+        # Admin bypass
         if user_id == ADMIN_USER_ID:
             logger.info("Admin user, unlimited access")
             return
-        
-        # Check if bot is admin
+
+        # Check bot permissions but DO NOT abort processing if missing - only toggle delete ability
+        can_delete = False
         try:
             bot_member = await context.bot.get_chat_member(update.effective_chat.id, context.bot.id)
-            logger.info(f"Bot status: {bot_member.status}")
-            if bot_member.status not in ["administrator", "creator"]:
-                logger.warning("Bot is not admin!")
-                return
+            logger.info(f"Bot member status: {bot_member.status}")
+            # If admin/owner -> check attribute
+            if isinstance(bot_member, (ChatMemberAdministrator, ChatMemberOwner)) or bot_member.status in ["administrator", "creator"]:
+                can_delete = getattr(bot_member, 'can_delete_messages', True)
+            else:
+                can_delete = getattr(bot_member, 'can_delete_messages', False)
+            if not can_delete:
+                logger.warning("Bot cannot delete messages — will skip deletions but continue processing.")
         except Exception as e:
             logger.error(f"Error checking bot status: {e}")
-            return
-        
-        # Get or create user
+            can_delete = False
+
+        # Ensure user in DB
         logger.info("Getting/creating user...")
         user = await get_or_create_user(user_id, username, first_name)
         await update_user_info(user_id, username, first_name)
-        
-        # Log command
+
+        # Log command (DB)
         logger.info("Logging command to database...")
         await log_command(user_id, username, command, update.effective_chat.id)
         logger.info("Command logged successfully!")
-        
-        # Check premium
+
+        # Premium check
         is_premium_user = await is_premium(user_id)
         logger.info(f"Premium status: {is_premium_user}")
-        
         if is_premium_user:
-            logger.info("User is premium, sending premium message")
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=f"💎 @{username or first_name}: Premium Member - Unlimited searches!",
-                reply_to_message_id=update.message.message_id
-            )
-            logger.info("Premium message sent!")
+            logger.info("User is premium, announcing in group")
+            try:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=f"💎 @{username}: Premium Member - Unlimited searches!",
+                    reply_to_message_id=update.message.message_id
+                )
+            except Exception as e:
+                logger.error(f"Failed to send premium msg: {e}")
             return
-        
-        # Reset daily count
+
+        # Reset daily count if needed
         logger.info("Resetting daily count if needed...")
-        await reset_daily_count(user_id)
-        
-        # Get fresh user data
-        logger.info("Getting fresh user data...")
+        await reset_daily_count_if_needed(user_id)
+
+        # Re-fetch user
         user = await users_collection.find_one({'user_id': user_id})
         limit = await get_user_message_limit(user_id)
         count = user.get('message_count', 0)
-        
         logger.info(f"User count: {count}/{limit}")
-        
-        # Check if limit exceeded
+
+        # If limit exceeded -> delete (if possible) and notify
         if count >= limit:
-            logger.info("LIMIT EXCEEDED! Deleting message and sending block notification")
-            is_new = user.get('is_new_user', False)
+            logger.info("LIMIT EXCEEDED! Will block user until midnight.")
             midnight = get_midnight_kolkata()
-            
             try:
-                # Delete user's command
-                await update.message.delete()
-                logger.info("User message deleted")
-                
-                # Send block notification
+                if can_delete:
+                    try:
+                        await update.message.delete()
+                        logger.info("User message deleted")
+                    except Exception as e:
+                        logger.error(f"Failed to delete message: {e}")
+                else:
+                    logger.info("Skipping deletion due to missing permission.")
                 block_msg = await context.bot.send_message(
                     chat_id=update.effective_chat.id,
-                    text=f"⛔ @{username or first_name} - BLOCKED UNTIL MIDNIGHT\n\n"
-                         f"You've used {limit}/{limit} {'welcome bonus ' if is_new else ''}searches today.\n"
+                    text=f"⛔ @{username} - BLOCKED UNTIL MIDNIGHT\n\n"
+                         f"You've used {limit}/{limit} searches today.\n"
                          f"You cannot send ANY commands until midnight.\n\n"
                          f"🕐 Resets at: {midnight.strftime('%H:%M')} IST\n\n"
                          f"💎 Upgrade to Premium for unlimited searches!\n"
-                         f"Use /premium to upgrade now!"
+                         f"Use /premium to upgrade now!",
+                    reply_to_message_id=None
                 )
                 logger.info("Block notification sent!")
             except Exception as e:
                 logger.error(f"Error blocking user: {e}")
             return
-        
-        # Increment count
+
+        # Increment user's message count
         logger.info("Incrementing message count...")
-        await users_collection.update_one(
-            {'user_id': user_id},
-            {'$inc': {'message_count': 1}}
-        )
-        logger.info("Count incremented!")
-        
+        try:
+            await users_collection.update_one({'user_id': user_id}, {'$inc': {'message_count': 1}})
+            logger.info("Count incremented!")
+        except Exception as e:
+            logger.error(f"Failed to increment count: {e}")
+
         remaining = limit - (count + 1)
         is_new = user.get('is_new_user', False)
-        
-        logger.info(f"Remaining: {remaining}")
-        
+        logger.info(f"Remaining after increment: {remaining}")
+
+        # Send a status message or last warning
         try:
             if remaining > 0:
-                # Send status message
-                logger.info("Sending status message...")
                 status_msg = await context.bot.send_message(
                     chat_id=update.effective_chat.id,
-                    text=f"📊 @{username or first_name}: {remaining}/{limit} search{'es' if remaining != 1 else ''} remaining today{' 🎁' if is_new else ''}",
+                    text=f"📊 @{username}: {remaining}/{limit} search{'es' if remaining != 1 else ''} remaining today{' 🎁' if is_new else ''}",
                     reply_to_message_id=update.message.message_id
                 )
                 logger.info("Status message sent!")
             else:
-                # Last message warning
-                logger.info("Sending last message warning...")
                 midnight = get_midnight_kolkata()
                 warning_msg = await context.bot.send_message(
                     chat_id=update.effective_chat.id,
-                    text=f"⚠️ @{username or first_name}: This was your last search for today!\n"
+                    text=f"⚠️ @{username}: This was your last search for today!\n"
                          f"Next command will be blocked until {midnight.strftime('%H:%M')} IST.\n"
                          f"💎 Upgrade to Premium: /premium",
                     reply_to_message_id=update.message.message_id
                 )
                 logger.info("Warning message sent!")
         except Exception as e:
-            logger.error(f"Error sending status: {e}")
-    except Exception as e:
-        logger.error(f"CRITICAL ERROR in handle_group_message: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
+            logger.error(f"Failed to send status/warning: {e}")
 
-def main():
-    import asyncio
-    from threading import Thread
-    from http.server import HTTPServer, BaseHTTPRequestHandler
+    except Exception as e:
+        logger.error(f"CRITICAL ERROR in handle_group_message: {e}", exc_info=True)
+
+# -----------------------
+# Main / Run
+# -----------------------
+def start_health_server(port):
     class HealthCheckHandler(BaseHTTPRequestHandler):
         def do_GET(self):
             self.send_response(200)
@@ -497,14 +572,25 @@ def main():
             self.wfile.write(b'Bot running!')
         def log_message(self, format, *args):
             pass
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(init_mongodb())
-    port = int(os.environ.get('PORT', 10000))
+
     server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
     Thread(target=server.serve_forever, daemon=True).start()
-    logger.info(f"Health check: {port}")
+    logger.info(f"Health check server started on port {port}")
+
+def main():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # init db first
+    loop.run_until_complete(init_mongodb())
+
+    # health check (useful for Render)
+    start_health_server(PORT)
+    logger.info(f"Health check: {PORT}")
+
     application = Application.builder().token(BOT_TOKEN).build()
+
+    # Register handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("premium", premium_menu))
@@ -513,9 +599,19 @@ def main():
     application.add_handler(CommandHandler("database", database_command))
     application.add_handler(CallbackQueryHandler(handle_plan_selection, pattern="^buy_"))
     application.add_handler(CallbackQueryHandler(handle_payment_confirmation, pattern="^(confirm|reject)_"))
-    application.add_handler(MessageHandler(filters.ALL, handle_group_message))
-    logger.info("🚀 Bot Started!")
+    application.add_handler(MessageHandler(filters.ALL & (~filters.User(bot_id=int(BOT_TOKEN.split(':')[0]))), handle_group_message))
+
+    logger.info("🚀 Bot Initialized!")
     logger.info(f"Time: {get_kolkata_time().strftime('%Y-%m-%d %H:%M:%S')} IST")
+
+    # IMPORTANT: delete any webhook to avoid 409 Conflict when polling.
+    try:
+        loop.run_until_complete(application.bot.delete_webhook(drop_pending_updates=True))
+        logger.info("Webhook removed (if any). Starting polling.")
+    except Exception as e:
+        logger.warning(f"Couldn't delete webhook (non-fatal): {e}")
+
+    # Start polling (blocking call)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
