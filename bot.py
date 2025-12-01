@@ -8,6 +8,7 @@ import asyncio
 # Configuration
 BOT_TOKEN = "8597564579:AAGHr1Rqi8ZIqD_RA8PuslB1ob6bAjtOEhU"
 ADMIN_USERNAME = "itsmezigzagzozo"
+ADMIN_USER_ID = 6314556756  # Admin user ID for /allow command
 DAILY_MESSAGE_LIMIT = 1      # Regular users: 1 message per day
 NEW_USER_MESSAGE_LIMIT = 5   # New users: 5 messages on first day
 
@@ -380,6 +381,83 @@ async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"3. Use /test in the group"
         )
 
+async def allow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to grant premium access to users"""
+    user_id = update.effective_user.id
+    
+    # Check if user is admin
+    if user_id != ADMIN_USER_ID:
+        await update.message.reply_text("⛔ This command is only for admins.")
+        return
+    
+    # Parse command: /allow <user_id> <days>
+    try:
+        if len(context.args) < 2:
+            await update.message.reply_text(
+                "❌ Invalid format!\n\n"
+                "Usage:\n"
+                "/allow <user_id> <days>\n\n"
+                "Examples:\n"
+                "/allow 123456789 7\n"
+                "/allow 123456789 30\n\n"
+                "Quick commands:\n"
+                "/allow <user_id> 7 - Grant 7 days\n"
+                "/allow <user_id> 30 - Grant 30 days"
+            )
+            return
+        
+        target_user_id = int(context.args[0])
+        days = int(context.args[1])
+        
+        if days <= 0:
+            await update.message.reply_text("❌ Days must be greater than 0!")
+            return
+        
+        # Grant premium access
+        expires = datetime.now() + timedelta(days=days)
+        plan = "week" if days == 7 else "month" if days == 30 else "custom"
+        
+        premium_users[target_user_id] = {
+            "expires": expires,
+            "plan": plan,
+            "activated": datetime.now()
+        }
+        
+        await update.message.reply_text(
+            f"✅ PREMIUM GRANTED!\n\n"
+            f"User ID: {target_user_id}\n"
+            f"Duration: {days} days\n"
+            f"Expires: {expires.strftime('%Y-%m-%d %H:%M')}\n\n"
+            f"User now has unlimited searches!"
+        )
+        
+        # Try to notify the user
+        try:
+            await context.bot.send_message(
+                chat_id=target_user_id,
+                text=f"🎉 PREMIUM ACTIVATED!\n\n"
+                     f"Duration: {days} days\n"
+                     f"Expires: {expires.strftime('%Y-%m-%d %H:%M')}\n\n"
+                     f"✅ You now have unlimited searches!\n"
+                     f"Use /status to check your membership."
+            )
+        except Exception as e:
+            logger.error(f"Could not notify user {target_user_id}: {e}")
+            await update.message.reply_text(
+                "⚠️ Premium granted but couldn't notify user.\n"
+                "They need to start the bot first."
+            )
+    
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Invalid input!\n\n"
+            "User ID and days must be numbers.\n"
+            "Example: /allow 123456789 7"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+        logger.error(f"Error in allow_command: {e}")
+
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle messages in the group"""
     logger.info(f"Received message: {update.message.text if update.message else 'No message'}")
@@ -406,14 +484,15 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     command = message_text.split()[0].lower()
     logger.info(f"Command extracted: {command}")
     
-    bot_commands = ['/start', '/status', '/premium', '/help', '/test']
+    bot_commands = ['/start', '/status', '/premium', '/help', '/test', '/allow']
     if command in bot_commands:
         logger.info(f"Bot management command {command}, ignoring")
         return
     
     logger.info(f"This command will be counted: {command}")
     
-    if update.effective_user.username == ADMIN_USERNAME:
+    # Admin has unlimited messages
+    if update.effective_user.username == ADMIN_USERNAME or user_id == ADMIN_USER_ID:
         logger.info("User is admin, unlimited access")
         return
     
@@ -434,8 +513,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 text=f"💎 @{user_name}: Premium Member - Unlimited searches!",
                 reply_to_message_id=update.message.message_id
             )
-            await asyncio.sleep(3)
-            await premium_msg.delete()
+            # Don't delete premium notification
         except Exception as e:
             logger.error(f"Error sending premium status: {e}")
         return
@@ -449,9 +527,11 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         is_new = user_messages[user_id]["is_new_user"]
         logger.info(f"User {user_name} exceeded limit, deleting message")
         try:
+            # Delete the user's command message
             await update.message.delete()
             
-            limit_msg = await context.bot.send_message(
+            # Send limit reached notification (don't delete)
+            await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 text=f"⛔ @{user_name} - DAILY LIMIT REACHED\n\n"
                      f"You've used {limit}/{limit} {'welcome bonus ' if is_new else ''}searches today.\n\n"
@@ -460,11 +540,8 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                      f"Use /premium to upgrade now!",
                 reply_to_message_id=None
             )
-            
-            await asyncio.sleep(1000)
-            await limit_msg.delete()
         except Exception as e:
-            logger.error(f"Error deleting message: {e}")
+            logger.error(f"Error handling limit exceeded: {e}")
         return
     
     user_messages[user_id]["count"] += 1
@@ -475,28 +552,23 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     
     try:
         if remaining > 0:
-            status_msg = await context.bot.send_message(
+            # Send status message (don't delete)
+            await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 text=f"📊 @{user_name}: {remaining}/{limit} search{'es' if remaining != 1 else ''} remaining today"
                      f"{' 🎁' if is_new else ''}",
                 reply_to_message_id=update.message.message_id
             )
-            
-            logger.info(f"Sent status message, will delete in 5 seconds")
-            await asyncio.sleep(5)
-            await status_msg.delete()
-            logger.info("Status message deleted")
+            logger.info(f"Sent status message")
         else:
-            warning_msg = await context.bot.send_message(
+            # Last message warning (don't delete)
+            await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 text=f"⚠️ @{user_name}: This was your last search for today!\n"
                      f"Next search will be blocked.\n"
                      f"💎 Upgrade to Premium: /premium",
                 reply_to_message_id=update.message.message_id
             )
-            
-            await asyncio.sleep(8)
-            await warning_msg.delete()
     except Exception as e:
         logger.error(f"Error sending status: {e}")
 
@@ -530,6 +602,7 @@ def main():
     application.add_handler(CommandHandler("premium", premium_menu))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("test", test_command))
+    application.add_handler(CommandHandler("allow", allow_command))  # Admin command
     
     # Callback handlers
     application.add_handler(CallbackQueryHandler(handle_plan_selection, pattern="^buy_"))
