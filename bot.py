@@ -461,7 +461,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 reply_to_message_id=None
             )
             
-            await asyncio.sleep(10)
+            await asyncio.sleep(1000)
             await limit_msg.delete()
         except Exception as e:
             logger.error(f"Error deleting message: {e}")
