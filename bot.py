@@ -6,7 +6,7 @@ from collections import defaultdict
 import json
 
 # Configuration
-BOT_TOKEN = "8597564579:AAGBmsRfsuZljUV51jhQEw6_CLWm5CrYxaU"
+BOT_TOKEN = "8597564579:AAGHr1Rqi8ZIqD_RA8PuslB1ob6bAjtOEhU"
 ADMIN_USERNAME = "itsmezigzagzozo"
 DAILY_MESSAGE_LIMIT = 1      # Regular users: 1 message per day
 NEW_USER_MESSAGE_LIMIT = 5   # New users: 5 messages on first day
