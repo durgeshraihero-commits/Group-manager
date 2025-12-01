@@ -1,526 +1,1022 @@
-#!/usr/bin/env python3
-# FULL Group Manager Bot — MongoDB + Hardcoded Config + No Boolean Collection Errors
+import logging
+import os
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
+from datetime import datetime, timedelta
+from motor.motor_asyncio import AsyncIOMotorClient
+import pytz
+import json
+import io
 
-import os, io, csv, json, logging, asyncio
-from datetime import datetime, timedelta, time, timezone
-from typing import Dict, Any
-import motor.motor_asyncio
-from zoneinfo import ZoneInfo
+# Configuration from environment variables
+BOT_TOKEN = os.environ.get('BOT_TOKEN', '8597564579:AAGHr1Rqi8ZIqD_RA8PuslB1ob6bAjtOEhU')
+MONGODB_URI = os.environ.get('MONGODB_URI', 'mongodb+srv://prarthanaray147_db_user:fMuTkgFsaHa5NRIy@cluster0.txn8bv3.mongodb.net/tg_bot_db?retryWrites=true&w=majority')
+MONGODB_DBNAME = os.environ.get('MONGODB_DBNAME', 'tg_bot_db')
+ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', 'itsmezigzagzozo')
+ADMIN_USER_ID = int(os.environ.get('ADMIN_USER_ID', '6314556756'))
+DAILY_MESSAGE_LIMIT = int(os.environ.get('DAILY_MESSAGE_LIMIT', '1'))
+NEW_USER_MESSAGE_LIMIT = int(os.environ.get('NEW_USER_MESSAGE_LIMIT', '5'))
 
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    ChatPermissions, InputFile
-)
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
-)
+# Timezone
+KOLKATA_TZ = pytz.timezone('Asia/Kolkata')
 
-# ---------------------------------------------------
-# CONFIG (HARDCODED)
-# ---------------------------------------------------
-BOT_TOKEN = "8597564579:AAGHr1Rqi8ZIqD_RA8PuslB1ob6bAjtOEhU"
-MONGODB_URI = "mongodb+srv://prarthanaray147_db_user:fMuTkgFsaHa5NRIy@cluster0.txn8bv3.mongodb.net/tg_bot_db?retryWrites=true&w=majority"
-MONGODB_DBNAME = "tg_bot_db"
-
-ADMIN_USERNAME = "itsmezigzagzozo"
-ADMIN_USER_ID = 6314556756
-
-DAILY_MESSAGE_LIMIT = 1
-NEW_USER_MESSAGE_LIMIT = 5
-
+# Premium Plans
 PREMIUM_PLANS = {
-    "week": {"price": 300, "duration_days": 7},
-    "month": {"price": 500, "duration_days": 30},
+    "week": {"price": 300, "duration_days": 7, "name": "Weekly"},
+    "month": {"price": 500, "duration_days": 30, "name": "Monthly"}
 }
 
-IST = ZoneInfo("Asia/Kolkata")
-LOCAL_USERS_FILE = "users.json"
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------
-# MONGO
-# ---------------------------------------------------
+# MongoDB client
 mongo_client = None
 db = None
-users_coll = None
-payments_coll = None
+users_collection = None
+commands_collection = None
+pending_payments = {}
 
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-async def init_mongo():
-    global mongo_client, db, users_coll, payments_coll
+async def init_mongodb():
+    """Initialize MongoDB connection"""
+    global mongo_client, db, users_collection, commands_collection
+    
     try:
-        mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGODB_URI)
+        mongo_client = AsyncIOMotorClient(MONGODB_URI)
         db = mongo_client[MONGODB_DBNAME]
-
-        users_coll = db["users"]
-        payments_coll = db["pending_payments"]
-
-        await users_coll.create_index("user_id", unique=True)
-        logger.info("Connected to MongoDB & index ready")
+        users_collection = db['users']
+        commands_collection = db['commands']
+        
+        # Create indexes
+        await users_collection.create_index('user_id', unique=True)
+        await commands_collection.create_index([('user_id', 1), ('timestamp', -1)])
+        
+        logger.info("✅ MongoDB connected successfully!")
     except Exception as e:
-        logger.error(f"MongoDB init error: {e}")
-        users_coll = None
-        payments_coll = None
+        logger.error(f"❌ MongoDB connection failed: {e}")
+        raise
 
-# ---------------------------------------------------
-# CACHE + TIME HELPERS
-# ---------------------------------------------------
-user_cache: Dict[int, Dict[str, Any]] = {}
+def get_kolkata_time():
+    """Get current time in Asia/Kolkata timezone"""
+    return datetime.now(KOLKATA_TZ)
 
-now_ist = lambda: datetime.now(tz=IST)
-now_ist_iso = lambda: now_ist().isoformat(timespec="seconds")
+def get_midnight_kolkata():
+    """Get next midnight in Asia/Kolkata timezone"""
+    now = get_kolkata_time()
+    midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight
 
+async def get_or_create_user(user_id, username, first_name):
+    """Get user from database or create new one"""
+    user = await users_collection.find_one({'user_id': user_id})
+    
+    if not user:
+        # Create new user
+        now = get_kolkata_time()
+        user = {
+            'user_id': user_id,
+            'username': username,
+            'first_name': first_name,
+            'registration_time': now,
+            'is_new_user': True,
+            'message_count': 0,
+            'last_reset': now.date().isoformat(),
+            'premium_history': [],
+            'current_premium': None,
+            'total_commands': 0
+        }
+        await users_collection.insert_one(user)
+        logger.info(f"New user created: {user_id} (@{username})")
+    
+    return user
 
-def next_midnight_ist_as_utc():
-    now = now_ist()
-    midnight = datetime.combine(now.date() + timedelta(days=1), time(0, 0), tzinfo=IST)
-    return midnight.astimezone(timezone.utc)
-
-# ---------------------------------------------------
-# LOAD + SAVE USERS
-# ---------------------------------------------------
-async def load_users_from_db():
-    user_cache.clear()
-
-    if users_coll is not None:
-        try:
-            async for doc in users_coll.find({}):
-                user_cache[int(doc["user_id"])] = doc
-            logger.info(f"Loaded {len(user_cache)} users from MongoDB")
-            return
-        except Exception as e:
-            logger.error(f"Failed loading from MongoDB: {e}")
-
-    if os.path.exists(LOCAL_USERS_FILE):
-        try:
-            with open(LOCAL_USERS_FILE) as f:
-                data = json.load(f)
-            for k, v in data.items():
-                user_cache[int(k)] = v
-            logger.info(f"Loaded {len(user_cache)} users from local JSON")
-        except Exception as e:
-            logger.error(f"Local file load error: {e}")
-
-
-async def persist_user_to_db(doc):
-    uid = doc["user_id"]
-    user_cache[uid] = doc
-
-    if users_coll is not None:
-        try:
-            await users_coll.update_one(
-                {"user_id": uid},
-                {"$set": doc},
-                upsert=True
-            )
-            return
-        except Exception as e:
-            logger.error(f"Mongo upsert error: {e}")
-
-    try:
-        with open(LOCAL_USERS_FILE, "w") as f:
-            json.dump({str(k): v for k, v in user_cache.items()}, f, indent=2)
-    except:
-        pass
-
-# ---------------------------------------------------
-# USER DOC + PREMIUM
-# ---------------------------------------------------
-def make_user_doc(uid, uname, fname):
-    return {
-        "user_id": uid,
-        "username": uname,
-        "first_name": fname,
-        "count": 0,
-        "date": now_ist().date().isoformat(),
-        "is_new_user": True,
-        "joined_date": now_ist_iso(),
-        "premium_expires": "",
-        "premium_plan": "",
-        "last_seen": now_ist_iso(),
-        "last_command": "",
-    }
-
-
-def is_premium_active(doc):
-    try:
-        if not doc.get("premium_expires"):
-            return False
-        return now_ist() < datetime.fromisoformat(doc["premium_expires"])
-    except:
-        return False
-
-
-async def record_event(event, doc):
-    await persist_user_to_db(doc)
-
-# ---------------------------------------------------
-# COMMAND HANDLERS
-# ---------------------------------------------------
-async def start_cmd(update, context):
-    u = update.effective_user
-    uid = u.id
-    uname = u.username or ""
-    fname = u.first_name or ""
-
-    if uid not in user_cache:
-        doc = make_user_doc(uid, uname, fname)
-        await persist_user_to_db(doc)
-        welcome = "\n🎁 Welcome Bonus Activated!"
-    else:
-        doc = user_cache[uid]
-        doc["username"] = uname
-        doc["first_name"] = fname
-        doc["last_seen"] = now_ist_iso()
-        await persist_user_to_db(doc)
-        welcome = ""
-
-    premium = "✅ PREMIUM" if is_premium_active(doc) else "🆓 FREE"
-    await update.message.reply_text(
-        f"👋 Hello!\nYour status: {premium}{welcome}\n\nUse /status to see limits."
+async def update_user_info(user_id, username, first_name):
+    """Update user info if changed"""
+    await users_collection.update_one(
+        {'user_id': user_id},
+        {'$set': {
+            'username': username,
+            'first_name': first_name
+        }}
     )
 
+async def log_command(user_id, username, command, chat_id):
+    """Log command to database"""
+    await commands_collection.insert_one({
+        'user_id': user_id,
+        'username': username,
+        'command': command,
+        'timestamp': get_kolkata_time(),
+        'chat_id': chat_id
+    })
+    
+    # Increment total commands
+    await users_collection.update_one(
+        {'user_id': user_id},
+        {'$inc': {'total_commands': 1}}
+    )
 
-async def status_cmd(update, context):
-    u = update.effective_user
-    uid = u.id
-
-    if uid not in user_cache:
-        return await update.message.reply_text("Use /start first.")
-
-    doc = user_cache[uid]
-    today = now_ist().date().isoformat()
-
-    if doc["date"] != today:
-        doc["count"] = 0
-        doc["date"] = today
-        await persist_user_to_db(doc)
-
-    if is_premium_active(doc):
-        return await update.message.reply_text(
-            f"💎 PREMIUM\nExpires: {doc['premium_expires']}"
+async def reset_daily_count(user_id):
+    """Reset message count if it's a new day (Asia/Kolkata time)"""
+    user = await users_collection.find_one({'user_id': user_id})
+    if not user:
+        return
+    
+    today = get_kolkata_time().date().isoformat()
+    
+    if user.get('last_reset') != today:
+        # New day - reset count
+        await users_collection.update_one(
+            {'user_id': user_id},
+            {'$set': {
+                'message_count': 0,
+                'last_reset': today,
+                'is_new_user': False  # No longer new user after first day
+            }}
         )
 
-    joined_today = doc["joined_date"].split("T")[0] == today
-    limit = NEW_USER_MESSAGE_LIMIT if (doc["is_new_user"] and joined_today) else DAILY_MESSAGE_LIMIT
+async def is_premium(user_id):
+    """Check if user has active premium"""
+    user = await users_collection.find_one({'user_id': user_id})
+    if not user or not user.get('current_premium'):
+        return False
+    
+    premium = user['current_premium']
+    expires = premium.get('expires')
+    
+    if expires and isinstance(expires, datetime):
+        if get_kolkata_time() < expires.replace(tzinfo=KOLKATA_TZ):
+            return True
+        else:
+            # Premium expired - remove it
+            await users_collection.update_one(
+                {'user_id': user_id},
+                {'$set': {'current_premium': None}}
+            )
+    
+    return False
 
-    await update.message.reply_text(f"🆓 Free User\nUsed {doc['count']}/{limit}")
-  # ---------------------------------------------------
-# PREMIUM MENU
-# ---------------------------------------------------
-async def premium_cmd(update, context):
-    kb = [
-        [InlineKeyboardButton("📅 Weekly ₹300", callback_data="buy_week")],
-        [InlineKeyboardButton("📆 Monthly ₹500", callback_data="buy_month")],
-        [InlineKeyboardButton("💬 Contact Admin", url=f"https://t.me/{ADMIN_USERNAME}")]
+async def get_user_message_limit(user_id):
+    """Get message limit for user"""
+    user = await users_collection.find_one({'user_id': user_id})
+    if not user:
+        return DAILY_MESSAGE_LIMIT
+    
+    if user.get('is_new_user', False):
+        return NEW_USER_MESSAGE_LIMIT
+    
+    return DAILY_MESSAGE_LIMIT
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command"""
+    user_id = update.effective_user.id
+    username = update.effective_user.username
+    first_name = update.effective_user.first_name
+    
+    user = await get_or_create_user(user_id, username, first_name)
+    await update_user_info(user_id, username, first_name)
+    
+    premium_status = "✅ PREMIUM" if await is_premium(user_id) else "🆓 FREE"
+    
+    welcome_bonus = ""
+    if user.get('is_new_user'):
+        welcome_bonus = f"\n🎁 Welcome Bonus: {NEW_USER_MESSAGE_LIMIT} searches for today!"
+    
+    await update.message.reply_text(
+        f"👋 Welcome to the Premium Membership Bot!\n\n"
+        f"Your Status: {premium_status}{welcome_bonus}\n\n"
+        f"🔍 Only messages starting with / are counted\n"
+        f"Examples: /num, /search, /find\n"
+        f"Regular chat is unlimited!\n\n"
+        f"📊 Free Users:\n"
+        f"• New Users: {NEW_USER_MESSAGE_LIMIT} searches (first day only)\n"
+        f"• Regular Users: {DAILY_MESSAGE_LIMIT} search/day\n"
+        f"• Resets daily at midnight (Asia/Kolkata)\n\n"
+        f"💎 Premium Users: Unlimited searches\n\n"
+        f"💰 Premium Plans:\n"
+        f"• Weekly: ₹300 (7 days)\n"
+        f"• Monthly: ₹500 (30 days)\n\n"
+        f"Commands:\n"
+        f"/status - Check your account\n"
+        f"/premium - View & buy premium plans\n"
+        f"/help - Get help"
+    )
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check user's status"""
+    user_id = update.effective_user.id
+    username = update.effective_user.username
+    first_name = update.effective_user.first_name
+    
+    user = await get_or_create_user(user_id, username, first_name)
+    await reset_daily_count(user_id)
+    
+    # Refresh user data
+    user = await users_collection.find_one({'user_id': user_id})
+    
+    if await is_premium(user_id):
+        premium = user.get('current_premium', {})
+        expires = premium.get('expires')
+        plan = premium.get('plan', 'custom')
+        
+        if expires:
+            expires_kolkata = expires.replace(tzinfo=KOLKATA_TZ)
+            days_left = (expires_kolkata - get_kolkata_time()).days
+            
+            await update.message.reply_text(
+                f"💎 PREMIUM MEMBER\n\n"
+                f"Plan: {PREMIUM_PLANS.get(plan, {}).get('name', 'Custom')}\n"
+                f"Expires: {expires_kolkata.strftime('%Y-%m-%d %H:%M')} IST\n"
+                f"Days Left: {days_left}\n"
+                f"Messages: Unlimited ♾️\n"
+                f"Total Commands: {user.get('total_commands', 0)}\n\n"
+                f"Use /premium to renew"
+            )
+    else:
+        count = user.get('message_count', 0)
+        limit = await get_user_message_limit(user_id)
+        remaining = limit - count
+        
+        user_type = "NEW USER 🎁" if user.get('is_new_user') else "FREE MEMBER"
+        midnight = get_midnight_kolkata()
+        
+        await update.message.reply_text(
+            f"🆓 {user_type}\n\n"
+            f"📊 Today's Messages:\n"
+            f"Used: {count}/{limit}\n"
+            f"Remaining: {remaining}\n"
+            f"{'(Welcome bonus!)' if user.get('is_new_user') else ''}\n\n"
+            f"🕐 Resets at: {midnight.strftime('%H:%M')} IST\n"
+            f"Total Commands: {user.get('total_commands', 0)}\n\n"
+            f"💎 Upgrade to Premium for unlimited messages!\n"
+            f"Use /premium to see plans"
+        )
+
+async def premium_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show premium plans"""
+    user_id = update.effective_user.id
+    
+    keyboard = [
+        [InlineKeyboardButton("📅 Weekly - ₹300", callback_data="buy_week")],
+        [InlineKeyboardButton("📆 Monthly - ₹500", callback_data="buy_month")],
+        [InlineKeyboardButton("💬 Contact Admin", url=f"https://t.me/{ADMIN_USERNAME}")],
     ]
-    await update.message.reply_text("Select a premium plan:", reply_markup=InlineKeyboardMarkup(kb))
+    
+    if await is_premium(user_id):
+        user = await users_collection.find_one({'user_id': user_id})
+        premium = user.get('current_premium', {})
+        expires = premium.get('expires')
+        if expires:
+            expires_kolkata = expires.replace(tzinfo=KOLKATA_TZ)
+            days_left = (expires_kolkata - get_kolkata_time()).days
+            status_text = f"✅ You're already Premium!\n\nExpires in {days_left} days\n\nWant to extend?\n\n"
+    else:
+        status_text = "💎 Premium Membership Plans:\n\n"
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        f"{status_text}"
+        f"📅 Weekly Plan: ₹300\n"
+        f"   • 7 days unlimited messages\n"
+        f"   • Best for short-term needs\n\n"
+        f"📆 Monthly Plan: ₹500\n"
+        f"   • 30 days unlimited messages\n"
+        f"   • Best value! Save ₹700\n\n"
+        f"Choose a plan below:",
+        reply_markup=reply_markup
+    )
 
-
-# ---------------------------------------------------
-# PREMIUM PURCHASE CALLBACK
-# ---------------------------------------------------
-async def plan_cb(update, context):
-    q = update.callback_query
-    await q.answer()
-
-    uid = q.from_user.id
-    plan = q.data.replace("buy_", "")
-
+async def handle_plan_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle premium plan purchase"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    user_name = query.from_user.username or query.from_user.first_name
+    plan = query.data.replace("buy_", "")
+    
     if plan not in PREMIUM_PLANS:
-        return await q.edit_message_text("❌ Invalid plan")
-
-    price = PREMIUM_PLANS[plan]["price"]
-
-    payment_id = f"{uid}_{plan}_{int(now_ist().timestamp())}"
-
-    # Store payment request
-    if payments_coll is not None:
-        await payments_coll.insert_one({
-            "_id": payment_id,
-            "user_id": uid,
-            "plan": plan,
-            "amount": price,
-            "time": now_ist_iso(),
-        })
-
-    # Notify admin
+        await query.edit_message_text("❌ Invalid plan selected.")
+        return
+    
+    plan_info = PREMIUM_PLANS[plan]
+    payment_id = f"{user_id}_{plan}_{datetime.now().timestamp()}"
+    
+    pending_payments[payment_id] = {
+        "user_id": user_id,
+        "user_name": user_name,
+        "plan": plan,
+        "amount": plan_info["price"],
+        "timestamp": get_kolkata_time()
+    }
+    
+    admin_keyboard = [
+        [
+            InlineKeyboardButton("✅ Confirm Payment", callback_data=f"confirm_{payment_id}"),
+            InlineKeyboardButton("❌ Reject", callback_data=f"reject_{payment_id}")
+        ]
+    ]
+    admin_markup = InlineKeyboardMarkup(admin_keyboard)
+    
     try:
         await context.bot.send_message(
             chat_id=ADMIN_USERNAME,
-            text=f"💰 Payment Request\nUser: {uid}\nPlan: {plan}\nAmount: ₹{price}\nPayment ID: {payment_id}",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("✅ Confirm", callback_data=f"confirm_{payment_id}"),
-                    InlineKeyboardButton("❌ Reject", callback_data=f"reject_{payment_id}")
-                ]
-            ])
+            text=f"💰 NEW PAYMENT REQUEST\n\n"
+                 f"User: @{user_name}\n"
+                 f"User ID: {user_id}\n"
+                 f"Plan: {plan_info['name']} Premium\n"
+                 f"Amount: ₹{plan_info['price']}\n"
+                 f"Duration: {plan_info['duration_days']} days\n\n"
+                 f"⚠️ Confirm only after receiving payment!",
+            reply_markup=admin_markup
         )
-    except:
-        pass
-
-    await q.edit_message_text(
-        f"💳 Payment Request Sent\nPay admin and wait for approval."
+    except Exception as e:
+        logger.error(f"Error notifying admin: {e}")
+        await query.edit_message_text("❌ Error sending request. Please contact admin directly.")
+        return
+    
+    await query.edit_message_text(
+        f"💳 Payment Instructions\n\n"
+        f"Plan: {plan_info['name']} Premium\n"
+        f"Amount: ₹{plan_info['price']}\n"
+        f"Duration: {plan_info['duration_days']} days\n\n"
+        f"📱 Send payment to: @{ADMIN_USERNAME}\n\n"
+        f"Payment Methods:\n"
+        f"• UPI\n"
+        f"• Bank Transfer\n"
+        f"• PayTM\n\n"
+        f"⏳ After payment, wait for admin confirmation.\n"
+        f"You'll be notified once approved!",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("💬 Contact Admin", url=f"https://t.me/{ADMIN_USERNAME}")
+        ]])
     )
 
-
-# ---------------------------------------------------
-# ADMIN CONFIRMATION CALLBACK
-# ---------------------------------------------------
-async def pay_confirm_cb(update, context):
-    q = update.callback_query
-    await q.answer()
-
-    if q.from_user.id != ADMIN_USER_ID:
-        return await q.answer("⛔ Admin only", show_alert=True)
-
-    action, payment_id = q.data.split("_", 1)
-
-    # Fetch pending payment
-    pay = None
-    if payments_coll is not None:
-        pay = await payments_coll.find_one({"_id": payment_id})
-
-    if not pay:
-        return await q.edit_message_text("❌ Payment not found")
-
-    uid = pay["user_id"]
-    plan = pay["plan"]
-
+async def handle_payment_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle admin payment confirmation"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.from_user.id != ADMIN_USER_ID:
+        await query.answer("⛔ Only admin can confirm payments!", show_alert=True)
+        return
+    
+    data = query.data
+    action, payment_id = data.split("_", 1)
+    
+    if payment_id not in pending_payments:
+        await query.edit_message_text("❌ Payment request expired or already processed.")
+        return
+    
+    payment_info = pending_payments[payment_id]
+    user_id = payment_info["user_id"]
+    user_name = payment_info["user_name"]
+    plan = payment_info["plan"]
+    amount = payment_info["amount"]
+    
     if action == "confirm":
-        days = PREMIUM_PLANS[plan]["duration_days"]
-        expires = now_ist() + timedelta(days=days)
-
-        doc = user_cache.get(uid, make_user_doc(uid, "", ""))
-        doc["premium_expires"] = expires.isoformat()
-        doc["premium_plan"] = plan
-
-        await persist_user_to_db(doc)
-
-        await context.bot.send_message(
-            chat_id=uid,
-            text=f"🎉 PREMIUM ACTIVATED!\nPlan: {plan}\nExpires: {expires}"
+        duration_days = PREMIUM_PLANS[plan]["duration_days"]
+        expires = get_kolkata_time() + timedelta(days=duration_days)
+        
+        # Update user premium status
+        premium_record = {
+            'plan': plan,
+            'expires': expires,
+            'activated': get_kolkata_time(),
+            'amount': amount,
+            'duration_days': duration_days
+        }
+        
+        await users_collection.update_one(
+            {'user_id': user_id},
+            {
+                '$set': {'current_premium': premium_record},
+                '$push': {'premium_history': premium_record}
+            }
         )
-
-        await q.edit_message_text("✅ Payment Confirmed")
+        
+        await query.edit_message_text(
+            f"✅ PAYMENT CONFIRMED\n\n"
+            f"User: @{user_name}\n"
+            f"Plan: {PREMIUM_PLANS[plan]['name']} Premium\n"
+            f"Amount: ₹{amount}\n"
+            f"Valid Until: {expires.strftime('%Y-%m-%d %H:%M')} IST\n\n"
+            f"Premium activated successfully! 🎉"
+        )
+        
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"🎉 PREMIUM ACTIVATED!\n\n"
+                     f"Plan: {PREMIUM_PLANS[plan]['name']}\n"
+                     f"Duration: {duration_days} days\n"
+                     f"Expires: {expires.strftime('%Y-%m-%d %H:%M')} IST\n\n"
+                     f"✅ You now have unlimited messages!\n"
+                     f"Use /status to check your membership."
+            )
+        except Exception as e:
+            logger.error(f"Error notifying user: {e}")
+    
     else:
-        await q.edit_message_text("❌ Payment Rejected")
+        await query.edit_message_text(
+            f"❌ PAYMENT REJECTED\n\n"
+            f"User: @{user_name}\n"
+            f"Amount: ₹{amount}"
+        )
+        
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"❌ Your payment request was rejected.\n\n"
+                     f"Please contact @{ADMIN_USERNAME} for details."
+            )
+        except Exception as e:
+            logger.error(f"Error notifying user: {e}")
+    
+    del pending_payments[payment_id]
 
-    if payments_coll is not None:
-        await payments_coll.delete_one({"_id": payment_id})
-
-
-# ---------------------------------------------------
-# ADMIN GIVE PREMIUM /allow
-# ---------------------------------------------------
-async def allow_cmd(update, context):
+async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to approve premium"""
     if update.effective_user.id != ADMIN_USER_ID:
-        return await update.message.reply_text("⛔ Admin only")
+        await update.message.reply_text("⛔ This command is only for admins.")
+        return
+    
+    try:
+        if len(context.args) < 2:
+            await update.message.reply_text(
+                "❌ Invalid format!\n\n"
+                "Usage: /approve <user_id> <days>\n\n"
+                "Examples:\n"
+                "/approve 123456789 7\n"
+                "/approve 123456789 30"
+            )
+            return
+        
+        target_user_id = int(context.args[0])
+        days = int(context.args[1])
+        
+        if days <= 0:
+            await update.message.reply_text("❌ Days must be greater than 0!")
+            return
+        
+        expires = get_kolkata_time() + timedelta(days=days)
+        plan = "week" if days == 7 else "month" if days == 30 else "custom"
+        
+        premium_record = {
+            'plan': plan,
+            'expires': expires,
+            'activated': get_kolkata_time(),
+            'amount': 0,
+            'duration_days': days,
+            'approved_by_admin': True
+        }
+        
+        # Ensure user exists
+        user = await users_collection.find_one({'user_id': target_user_id})
+        if not user:
+            await users_collection.insert_one({
+                'user_id': target_user_id,
+                'username': None,
+                'first_name': None,
+                'registration_time': get_kolkata_time(),
+                'is_new_user': False,
+                'message_count': 0,
+                'last_reset': get_kolkata_time().date().isoformat(),
+                'premium_history': [premium_record],
+                'current_premium': premium_record,
+                'total_commands': 0
+            })
+        else:
+            await users_collection.update_one(
+                {'user_id': target_user_id},
+                {
+                    '$set': {'current_premium': premium_record},
+                    '$push': {'premium_history': premium_record}
+                }
+            )
+        
+        await update.message.reply_text(
+            f"✅ PREMIUM APPROVED!\n\n"
+            f"User ID: {target_user_id}\n"
+            f"Duration: {days} days\n"
+            f"Expires: {expires.strftime('%Y-%m-%d %H:%M')} IST\n\n"
+            f"User now has unlimited searches!"
+        )
+        
+        try:
+            await context.bot.send_message(
+                chat_id=target_user_id,
+                text=f"🎉 PREMIUM ACTIVATED BY ADMIN!\n\n"
+                     f"Duration: {days} days\n"
+                     f"Expires: {expires.strftime('%Y-%m-%d %H:%M')} IST\n\n"
+                     f"✅ You now have unlimited searches!\n"
+                     f"Use /status to check your membership."
+            )
+        except Exception as e:
+            logger.error(f"Could not notify user {target_user_id}: {e}")
+            await update.message.reply_text("⚠️ Premium granted but couldn't notify user.")
+    
+    except ValueError:
+        await update.message.reply_text("❌ Invalid input! User ID and days must be numbers.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+        logger.error(f"Error in approve_command: {e}")
 
-    args = context.args
-    if len(args) < 2:
-        return await update.message.reply_text("Usage:\n/allow <user_id> <days>")
+async def database_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to get database export"""
+    if update.effective_user.id != ADMIN_USER_ID:
+        await update.message.reply_text("⛔ This command is only for admins.")
+        return
+    
+    try:
+        # Export all users
+        users = await users_collection.find().to_list(length=None)
+        
+        # Convert to JSON-serializable format
+        export_data = []
+        for user in users:
+            user_data = {
+                'user_id': user.get('user_id'),
+                'username': user.get('username'),
+                'first_name': user.get('first_name'),
+                'registration_time': user.get('registration_time').isoformat() if user.get('registration_time') else None,
+                'is_new_user': user.get('is_new_user'),
+                'message_count': user.get('message_count')
+                'last_reset': user.get('last_reset'),
+                'total_commands': user.get('total_commands', 0),
+                'current_premium': None,
+                'premium_history': []
+            }
+            
+            # Handle current premium
+            if user.get('current_premium'):
+                premium = user['current_premium']
+                user_data['current_premium'] = {
+                    'plan': premium.get('plan'),
+                    'expires': premium.get('expires').isoformat() if premium.get('expires') else None,
+                    'activated': premium.get('activated').isoformat() if premium.get('activated') else None,
+                    'amount': premium.get('amount'),
+                    'duration_days': premium.get('duration_days')
+                }
+            
+            # Handle premium history
+            for premium in user.get('premium_history', []):
+                user_data['premium_history'].append({
+                    'plan': premium.get('plan'),
+                    'expires': premium.get('expires').isoformat() if premium.get('expires') else None,
+                    'activated': premium.get('activated').isoformat() if premium.get('activated') else None,
+                    'amount': premium.get('amount'),
+                    'duration_days': premium.get('duration_days')
+                })
+            
+            export_data.append(user_data)
+        
+        # Create JSON file
+        json_data = json.dumps(export_data, indent=2, ensure_ascii=False)
+        file_buffer = io.BytesIO(json_data.encode('utf-8'))
+        file_buffer.name = f'database_export_{get_kolkata_time().strftime("%Y%m%d_%H%M%S")}.json'
+        
+        await update.message.reply_document(
+            document=file_buffer,
+            filename=file_buffer.name,
+            caption=f"📊 Database Export\n\n"
+                    f"Total Users: {len(export_data)}\n"
+                    f"Export Time: {get_kolkata_time().strftime('%Y-%m-%d %H:%M:%S')} IST"
+        )
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error exporting database: {e}")
+        logger.error(f"Error in database_command: {e}")
 
-    uid = int(args[0])
-    days = int(args[1])
-    expires = now_ist() + timedelta(days=days)
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show help message"""
+    await update.message.reply_text(
+        f"📚 BOT HELP\n\n"
+        f"🔍 Message Counting:\n"
+        f"• Only messages starting with / are counted\n"
+        f"• Examples: /num, /search, /find, etc.\n"
+        f"• Regular chat messages are NOT counted\n\n"
+        f"🆓 Free Members:\n"
+        f"• New Users: {NEW_USER_MESSAGE_LIMIT} searches (first day only)\n"
+        f"• Regular Users: {DAILY_MESSAGE_LIMIT} search per day\n"
+        f"• Resets daily at midnight (Asia/Kolkata)\n"
+        f"• Blocked until midnight if limit exceeded\n\n"
+        f"💎 Premium Members:\n"
+        f"• Unlimited searches\n"
+        f"• No restrictions\n\n"
+        f"💰 Premium Plans:\n"
+        f"• Weekly: ₹300 (7 days)\n"
+        f"• Monthly: ₹500 (30 days)\n\n"
+        f"📱 Commands:\n"
+        f"/start - Start bot\n"
+        f"/status - Check account\n"
+        f"/premium - Buy premium\n"
+        f"/help - This message\n\n"
+        f"Need help? Contact @{ADMIN_USERNAME}"
+    )
 
-    doc = user_cache.get(uid, make_user_doc(uid, "", ""))
-    doc["premium_expires"] = expires.isoformat()
-    doc["premium_plan"] = f"custom_{days}"
-
-    await persist_user_to_db(doc)
-
-    await update.message.reply_text("✅ Premium Granted")
-
-
-# ---------------------------------------------------
-# GROUP MESSAGE HANDLER
-# ---------------------------------------------------
-async def handle_group(update, context):
+async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle messages in the group"""
     if update.effective_chat.type not in ["group", "supergroup"]:
         return
-
-    msg = update.message
-    if not msg or not msg.text:
+    
+    if not update.message or not update.message.text:
         return
-
-    text = msg.text.strip()
-    if not text.startswith("/"):
-        return  # only count commands
-
-    u = update.effective_user
-    uid = u.id
-    uname = u.username or ""
-    fname = u.first_name or ""
-
-    # Admin bypasses
-    if uid == ADMIN_USER_ID or u.username == ADMIN_USERNAME:
+    
+    user_id = update.effective_user.id
+    username = update.effective_user.username
+    first_name = update.effective_user.first_name
+    message_text = update.message.text.strip()
+    
+    if not message_text.startswith('/'):
         return
-
-    # Ensure user exists
-    if uid not in user_cache:
-        doc = make_user_doc(uid, uname, fname)
-        await persist_user_to_db(doc)
-
-    doc = user_cache[uid]
-    today = now_ist().date().isoformat()
-
-    # Reset daily
-    if doc["date"] != today:
-        doc["count"] = 0
-        doc["date"] = today
-        await persist_user_to_db(doc)
-
-    # Premium bypass
-    if is_premium_active(doc):
+    
+    command = message_text.split()[0].lower()
+    
+    # Ignore bot management commands
+    bot_commands = ['/start', '/status', '/premium', '/help', '/approve', '/database']
+    if command in bot_commands:
         return
-
-    # Determine limit
-    joined_today = doc["joined_date"].split("T")[0] == today
-    limit = NEW_USER_MESSAGE_LIMIT if (doc["is_new_user"] and joined_today) else DAILY_MESSAGE_LIMIT
-
-    # LIMIT REACHED
-    if doc["count"] >= limit:
-        try:
-            await msg.delete()
-        except:
-            pass
-
+    
+    # Admin has unlimited access
+    if user_id == ADMIN_USER_ID:
+        return
+    
+    # Check if bot is admin
+    try:
+        bot_member = await context.bot.get_chat_member(update.effective_chat.id, context.bot.id)
+        if bot_member.status not in ["administrator", "creator"]:
+            return
+    except Exception as e:
+        logger.error(f"Error checking bot admin status: {e}")
+        return
+    
+    # Get or create user
+    user = await get_or_create_user(user_id, username, first_name)
+    await update_user_info(user_id, username, first_name)
+    
+    # Log the command
+    await log_command(user_id, username, command, update.effective_chat.id)
+    
+    # Check premium status
+    if await is_premium(user_id):
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text=f"⛔ @{uname} DAILY LIMIT REACHED\nUpgrade to premium!",
+            text=f"💎 @{username or first_name}: Premium Member - Unlimited searches!",
+            reply_to_message_id=update.message.message_id
         )
         return
-
-    # Increase count
-    doc["count"] += 1
-    doc["last_seen"] = now_ist_iso()
-    doc["last_command"] = text
-    await persist_user_to_db(doc)
-
-    remaining = limit - doc["count"]
-
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=f"📊 @{uname}: {remaining}/{limit} remaining today",
-        reply_to_message_id=msg.message_id,
-  )
-# ---------------------------------------------------
-# Admin-only helpers
-# ---------------------------------------------------
-def admin_only(func):
-    async def wrapper(update, context):
-        user = update.effective_user
-        if not user:
-            return
-        if user.id != ADMIN_USER_ID and user.username != ADMIN_USERNAME:
-            return await update.message.reply_text("⛔ This command is admin-only.")
-        return await func(update, context)
-    return wrapper
-
-@admin_only
-async def export_users_cmd(update, context):
-    if not user_cache:
-        return await update.message.reply_text("No users to export.")
-    output = io.StringIO()
-    writer = csv.writer(output)
-    headers = ["user_id","username","first_name","count","date","is_new_user","joined_date","premium_expires","premium_plan","last_seen","last_command"]
-    writer.writerow(headers)
-    for uid, doc in user_cache.items():
-        writer.writerow([doc.get(h,"") for h in headers])
-    bio = io.BytesIO(output.getvalue().encode("utf-8"))
-    bio.name = "users_export.csv"
-    bio.seek(0)
-    try:
-        await context.bot.send_document(chat_id=update.effective_user.id, document=InputFile(bio, filename="users_export.csv"))
-    except Exception as e:
-        await update.message.reply_text(f"Failed to send file: {e}")
-
-@admin_only
-async def get_user_cmd(update, context):
-    args = context.args
-    if not args:
-        return await update.message.reply_text("Usage: /get_user <user_id>")
-    try:
-        uid = int(args[0])
-    except:
-        return await update.message.reply_text("Invalid user id")
-    doc = user_cache.get(uid)
-    if not doc:
-        return await update.message.reply_text("User not found")
-    pretty = json.dumps(doc, ensure_ascii=False, indent=2)
-    if len(pretty) < 3500:
-        return await update.message.reply_text(f"<pre>{pretty}</pre>", parse_mode="HTML")
-    bio = io.BytesIO(pretty.encode("utf-8"))
-    bio.name = f"user_{uid}.json"
-    bio.seek(0)
-    await context.bot.send_document(chat_id=update.effective_user.id, document=InputFile(bio, filename=bio.name))
-
-@admin_only
-async def resync_cmd(update, context):
-    await load_users_from_db()
-    await update.message.reply_text(f"Resynced {len(user_cache)} users from DB")
-
-# ---------------------------------------------------
-# Build application & register handlers
-# ---------------------------------------------------
-def build_app():
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    # User commands
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("premium", premium_cmd))
-    app.add_handler(CommandHandler("allow", allow_cmd))
-
-    # Payment callbacks
-    app.add_handler(CallbackQueryHandler(plan_cb, pattern="^buy_"))
-    app.add_handler(CallbackQueryHandler(pay_confirm_cb, pattern="^(confirm|reject)_"))
-
-    # Admin utilities
-    app.add_handler(CommandHandler("export_users", export_users_cmd))
-    app.add_handler(CommandHandler("get_user", get_user_cmd))
-    app.add_handler(CommandHandler("resync", resync_cmd))
-
-    # Group message handler
-    app.add_handler(
-    MessageHandler(
-        filters.TEXT & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP),
-        handle_group
-    )
-                                       )
-    return app
-
-# ---------------------------------------------------
-# Main / startup
-# ---------------------------------------------------
-async def main():
-    logger.info("Starting bot setup...")
-    await init_mongo()
-    await load_users_from_db()
-    app = build_app()
-    logger.info("Bot started — polling.")
-    await app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-if __name__ == "__main__":
-    import asyncio
-    try:
-        # Try to run normally (works on plain Python processes)
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(main())
-    except RuntimeError:
-        # Event loop is already running (common on some hosts like Render).
-        # Create a task for main() and keep the loop alive.
-        loop = asyncio.get_event_loop()
-        loop.create_task(main())
+    
+    # Reset daily count if needed
+    await reset_daily_count(user_id)
+    
+    # Get fresh user data
+    user = await users_collection.find_one({'user_id': user_id})
+    limit = await get_user_message_limit(user_id)
+    count = user.get('message_count', 0)
+    
+    # Check if limit exceeded
+    if count >= limit:
+        is_new = user.get('is_new_user', False)
+        midnight = get_midnight_kolkata()
+        
         try:
-            loop.run_forever()
-        except KeyboardInterrupt:
-            logger.info("Bot stopped (KeyboardInterrupt)")
+            # Delete user's command
+            await update.message.delete()
+            
+            # Send block notification
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"⛔ @{username or first_name} - BLOCKED UNTIL MIDNIGHT\n\n"
+                     f"You've used {limit}/{limit} {'welcome bonus ' if is_new else ''}searches today.\n"
+                     f"You cannot send ANY commands until midnight.\n\n"
+                     f"🕐 Resets at: {midnight.strftime('%H:%M')} IST\n\n"
+                     f"💎 Upgrade to Premium for unlimited searches!\n"
+                     f"Use /premium to upgrade now!",
+                reply_to_message_id=None
+            )
+        except Exception as e:
+            logger.error(f"Error blocking user: {e}")
+        return
+    
+    # Increment count
+    await users_collection.update_one(
+        {'user_id': user_id},
+        {'$inc': {'message_count': 1}}
+    )
+    
+    remaining = limit - (count + 1)
+    is_new = user.get('is_new_user', False)
+    
+    try:
+        if remaining > 0:
+            # Send status message
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"📊 @{username or first_name}: {remaining}/{limit} search{'es' if remaining != 1 else ''} remaining today"
+                     f"{' 🎁' if is_new else ''}",
+                reply_to_message_id=update.message.message_id
+            )
+        else:
+            # Last message warning
+            midnight = get_midnight_kolkata()
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"⚠️ @{username or first_name}: This was your last search for today!\n"
+                     f"Next command will be blocked until {midnight.strftime('%H:%M')} IST.\n"
+                     f"💎 Upgrade to Premium: /premium",
+                reply_to_message_id=update.message.message_id
+            )
+    except Exception as e:
+        logger.error(f"Error sending status: {e}")
+
+def main():
+    """Start the bot"""
+    import asyncio
+    from threading import Thread
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    
+    class HealthCheckHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'Bot is running!')
+        
+        def log_message(self, format, *args):
+            pass
+    
+    # Initialize MongoDB
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(init_mongodb())
+    
+    port = int(os.environ.get('PORT', 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    health_thread = Thread(target=server.serve_forever, daemon=True)
+    health_thread.start()
+    logger.info(f"Health check server started on port {port}")
+    
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Command handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("premium", premium_menu))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("approve", approve_command))
+    application.add_handler(CommandHandler("database", database_command))
+    
+    # Callback handlers
+    application.add_handler(CallbackQueryHandler(handle_plan_selection, pattern="^buy_"))
+    application.add_handler(CallbackQueryHandler(handle_payment_confirmation, pattern="^(confirm|reject)_"))
+    
+    # Message handler
+    application.add_handler(MessageHandler(filters.ALL, handle_group_message))
+    
+    logger.info("🚀 Premium Membership Bot Started with MongoDB!")
+    logger.info(f"Timezone: Asia/Kolkata")
+    logger.info(f"Current time: {get_kolkata_time().strftime('%Y-%m-%d %H:%M:%S')} IST")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
+                'last_reset': user.get('last_reset'),
+                'total_commands': user.get('total_commands', 0),
+                'current_premium': None,
+                'premium_history': []
+            }
+            
+            # Handle current premium
+            if user.get('current_premium'):
+                premium = user['current_premium']
+                user_data['current_premium'] = {
+                    'plan': premium.get('plan'),
+                    'expires': premium.get('expires').isoformat() if premium.get('expires') else None,
+                    'activated': premium.get('activated').isoformat() if premium.get('activated') else None,
+                    'amount': premium.get('amount'),
+                    'duration_days': premium.get('duration_days')
+                }
+            
+            # Handle premium history
+            for premium in user.get('premium_history', []):
+                user_data['premium_history'].append({
+                    'plan': premium.get('plan'),
+                    'expires': premium.get('expires').isoformat() if premium.get('expires') else None,
+                    'activated': premium.get('activated').isoformat() if premium.get('activated') else None,
+                    'amount': premium.get('amount'),
+                    'duration_days': premium.get('duration_days')
+                })
+            
+            export_data.append(user_data)
+        
+        # Create JSON file
+        json_data = json.dumps(export_data, indent=2, ensure_ascii=False)
+        file_buffer = io.BytesIO(json_data.encode('utf-8'))
+        file_buffer.name = f'database_export_{get_kolkata_time().strftime("%Y%m%d_%H%M%S")}.json'
+        
+        await update.message.reply_document(
+            document=file_buffer,
+            filename=file_buffer.name,
+            caption=f"📊 Database Export\n\n"
+                    f"Total Users: {len(export_data)}\n"
+                    f"Export Time: {get_kolkata_time().strftime('%Y-%m-%d %H:%M:%S')} IST"
+        )
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error exporting database: {e}")
+        logger.error(f"Error in database_command: {e}")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show help message"""
+    await update.message.reply_text(
+        f"📚 BOT HELP\n\n"
+        f"🔍 Message Counting:\n"
+        f"• Only messages starting with / are counted\n"
+        f"• Examples: /num, /search, /find, etc.\n"
+        f"• Regular chat messages are NOT counted\n\n"
+        f"🆓 Free Members:\n"
+        f"• New Users: {NEW_USER_MESSAGE_LIMIT} searches (first day only)\n"
+        f"• Regular Users: {DAILY_MESSAGE_LIMIT} search per day\n"
+        f"• Resets daily at midnight (Asia/Kolkata)\n"
+        f"• Blocked until midnight if limit exceeded\n\n"
+        f"💎 Premium Members:\n"
+        f"• Unlimited searches\n"
+        f"• No restrictions\n\n"
+        f"💰 Premium Plans:\n"
+        f"• Weekly: ₹300 (7 days)\n"
+        f"• Monthly: ₹500 (30 days)\n\n"
+        f"📱 Commands:\n"
+        f"/start - Start bot\n"
+        f"/status - Check account\n"
+        f"/premium - Buy premium\n"
+        f"/help - This message\n\n"
+        f"Need help? Contact @{ADMIN_USERNAME}"
+    )
+
+async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle messages in the group"""
+    if update.effective_chat.type not in ["group", "supergroup"]:
+        return
+    
+    if not update.message or not update.message.text:
+        return
+    
+    user_id = update.effective_user.id
+    username = update.effective_user.username
+    first_name = update.effective_user.first_name
+    message_text = update.message.text.strip()
+    
+    if not message_text.startswith('/'):
+        return
+    
+    command = message_text.split()[0].lower()
+    
+    # Ignore bot management commands
+    bot_commands = ['/start', '/status', '/premium', '/help', '/approve', '/database']
+    if command in bot_commands:
+        return
+    
+    # Admin has unlimited access
+    if user_id == ADMIN_USER_ID:
+        return
+    
+    # Check if bot is admin
+    try:
+        bot_member = await context.bot.get_chat_member(update.effective_chat.id, context.bot.id)
+        if bot_member.status not in ["administrator", "creator"]:
+            return
+    except Exception as e:
+        logger.error(f"Error checking bot admin status: {e}")
+        return
+    
+    # Get or create user
+    user = await get_or_create_user(user_id, username, first_name)
+    await update_user_info(user_id, username, first_name)
+    
+    # Log the command
+    await log_command(user_id, username, command, update.effective_chat.id)
+    
+    # Check premium status
+    if await is_premium(user_id):
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"💎 @{username or first_name}: Premium Member - Unlimited searches!",
+            reply_to_message_id=update.message.message_id
+        )
+        return
+    
+    # Reset daily count if needed
+    await reset_daily_count(user_id)
+    
+    # Get fresh user data
+    user = await users_collection.find_one({'user_id': user_id})
+    limit = await get_user_message_limit(user_id)
+    count = user.get('message_count', 0)
+    
+    # Check if limit exceeded
+    if count >= limit:
+        is_new = user.get('is_new_user', False)
+        midnight = get_midnight_kolkata()
+        
+        try:
+            # Delete user's command
+            await update.message.delete()
+            
+            # Send block notification
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"⛔ @{username or first_name} - BLOCKED UNTIL MIDNIGHT\n\n"
+                     f"You've used {limit}/{limit} {'welcome bonus ' if is_new else ''}searches today.\n"
+                     f"You cannot send ANY commands until midnight.\n\n"
+                     f"🕐 Resets at: {midnight.strftime('%H:%M')} IST\n\n"
+                     f"💎 Upgrade to Premium for unlimited searches!\n"
+                     f"Use /premium to upgrade now!",
+                reply_to_message_id=None
+            )
+        except Exception as e:
+            logger.error(f"Error blocking user: {e}")
+        return
+    
+    # Increment count
+    await users_collection.update_one(
+        {'user_id': user_id},
+        {'$inc': {'message_count': 1}}
+    )
+    
+    remaining = limit - (count + 1)
+    is_new = user.get('is_new_user', False)
+    
+    try:
+        if remaining > 0:
+            # Send status message
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"📊 @{username or first_name}: {remaining}/{limit} search{'es' if remaining != 1 else ''} remaining today"
+                     f"{' 🎁' if is_new else ''}",
+                reply_to_message_id=update.message.message_id
+            )
+        else:
+            # Last message warning
+            midnight = get_midnight_kolkata()
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"⚠️ @{username or first_name}: This was your last search for today!\n"
+                     f"Next command will be blocked until {midnight.strftime('%H:%M')} IST.\n"
+                     f"💎 Upgrade to Premium: /premium",
+                reply_to_message_id=update.message.message_id
+            )
+    except Exception as e:
+        logger.error(f"Error sending status: {e}")
+
+def main():
+    """Start the bot"""
+    import asyncio
+    from threading import Thread
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    
+    class HealthCheckHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'Bot is running!')
+        
+        def log_message(self, format, *args):
+            pass
+    
+    # Initialize MongoDB
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(init_mongodb())
+    
+    port = int(os.environ.get('PORT', 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    health_thread = Thread(target=server.serve_forever, daemon=True)
+    health_thread.start()
+    logger.info(f"Health check server started on port {port}")
+    
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Command handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("premium", premium_menu))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("approve", approve_command))
+    application.add_handler(CommandHandler("database", database_command))
+    
+    # Callback handlers
+    application.add_handler(CallbackQueryHandler(handle_plan_selection, pattern="^buy_"))
+    application.add_handler(CallbackQueryHandler(handle_payment_confirmation, pattern="^(confirm|reject)_"))
+    
+    # Message handler
+    application.add_handler(MessageHandler(filters.ALL, handle_group_message))
+    
+    logger.info("🚀 Premium Membership Bot Started with MongoDB!")
+    logger.info(f"Timezone: Asia/Kolkata")
+    logger.info(f"Current time: {get_kolkata_time().strftime('%Y-%m-%d %H:%M:%S')} IST")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
