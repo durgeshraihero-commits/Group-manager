@@ -510,7 +510,17 @@ async def main():
     await app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
+    import asyncio
     try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot stopped (KeyboardInterrupt)")
+        # Try to run normally (works on plain Python processes)
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(main())
+    except RuntimeError:
+        # Event loop is already running (common on some hosts like Render).
+        # Create a task for main() and keep the loop alive.
+        loop = asyncio.get_event_loop()
+        loop.create_task(main())
+        try:
+            loop.run_forever()
+        except KeyboardInterrupt:
+            logger.info("Bot stopped (KeyboardInterrupt)")
