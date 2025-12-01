@@ -6,7 +6,7 @@ from collections import defaultdict
 import json
 
 # Configuration
-BOT_TOKEN = "8597564579:AAGBmsRfsuZljUV51jhQEw6_CLWm5CrYxaU"
+BOT_TOKEN = "8178740511:AAEv7r1qLoorgLXcxQoxLN8szd9vpU6ILFo"
 ADMIN_USERNAME = "itsmezigzagzozo"
 DAILY_MESSAGE_LIMIT = 1      # Regular users: 1 message per day
 NEW_USER_MESSAGE_LIMIT = 5   # New users: 5 messages on first day
@@ -333,32 +333,46 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle messages in the group"""
+    # Debug logging
+    logger.info(f"Received message: {update.message.text if update.message else 'No message'}")
+    logger.info(f"Chat type: {update.effective_chat.type if update.effective_chat else 'No chat'}")
+    
     # Only process group messages
     if update.effective_chat.type not in ["group", "supergroup"]:
+        logger.info("Not a group message, ignoring")
         return
     
     # Ignore if no message or no text
     if not update.message or not update.message.text:
+        logger.info("No message text, ignoring")
         return
     
     user_id = update.effective_user.id
     user_name = update.effective_user.username or update.effective_user.first_name
     message_text = update.message.text.strip()
     
+    logger.info(f"Processing message from {user_name}: {message_text}")
+    
     # ONLY COUNT MESSAGES STARTING WITH /
     if not message_text.startswith('/'):
+        logger.info("Message doesn't start with /, ignoring")
         return
     
     # Extract command (first word)
     command = message_text.split()[0].lower()
+    logger.info(f"Command extracted: {command}")
     
     # Ignore ONLY bot management commands - count everything else
     bot_commands = ['/start', '/status', '/premium', '/help', '/test']
     if command in bot_commands:
+        logger.info(f"Bot management command {command}, ignoring")
         return
+    
+    logger.info(f"This command will be counted: {command}")
     
     # Admin has unlimited messages
     if update.effective_user.username == ADMIN_USERNAME:
+        logger.info("User is admin, unlimited access")
         return
     
     # Check if bot is admin (needed to delete messages)
@@ -373,17 +387,17 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     
     # Premium users have unlimited messages
     if is_premium(user_id):
+        logger.info(f"User {user_name} is premium")
         try:
             premium_msg = await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 text=f"💎 @{user_name}: Premium Member - Unlimited searches!",
                 reply_to_message_id=update.message.message_id
             )
-            # Delete after 3 seconds
-            await context.application.job_queue.run_once(
-                lambda _: premium_msg.delete(),
-                when=3
-            )
+            # Delete after 3 seconds using asyncio
+            import asyncio
+            await asyncio.sleep(3)
+            await premium_msg.delete()
         except Exception as e:
             logger.error(f"Error sending premium status: {e}")
         return
@@ -394,9 +408,12 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     # Get user's message limit
     limit = get_user_message_limit(user_id)
     
+    logger.info(f"User {user_name} count: {user_messages[user_id]['count']}/{limit}")
+    
     # Check message limit
     if user_messages[user_id]["count"] >= limit:
         is_new = user_messages[user_id]["is_new_user"]
+        logger.info(f"User {user_name} exceeded limit, deleting message")
         try:
             await update.message.delete()
             
@@ -412,10 +429,9 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             
             # Delete the notification after 10 seconds
-            await context.application.job_queue.run_once(
-                lambda _: limit_msg.delete(),
-                when=10
-            )
+            import asyncio
+            await asyncio.sleep(10)
+            await limit_msg.delete()
         except Exception as e:
             logger.error(f"Error deleting message: {e}")
         return
@@ -424,6 +440,8 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     user_messages[user_id]["count"] += 1
     remaining = limit - user_messages[user_id]["count"]
     is_new = user_messages[user_id]["is_new_user"]
+    
+    logger.info(f"Incremented count for {user_name}. New count: {user_messages[user_id]['count']}, Remaining: {remaining}")
     
     # Show remaining messages after EVERY message
     try:
@@ -435,11 +453,12 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 reply_to_message_id=update.message.message_id
             )
             
+            logger.info(f"Sent status message, will delete in 5 seconds")
             # Delete status message after 5 seconds
-            await context.application.job_queue.run_once(
-                lambda _: status_msg.delete(),
-                when=5
-            )
+            import asyncio
+            await asyncio.sleep(5)
+            await status_msg.delete()
+            logger.info("Status message deleted")
         else:
             # Last message - warn about limit
             warning_msg = await context.bot.send_message(
@@ -451,10 +470,9 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             
             # Delete warning after 8 seconds
-            await context.application.job_queue.run_once(
-                lambda _: warning_msg.delete(),
-                when=8
-            )
+            import asyncio
+            await asyncio.sleep(8)
+            await warning_msg.delete()
     except Exception as e:
         logger.error(f"Error sending status: {e}")
 
