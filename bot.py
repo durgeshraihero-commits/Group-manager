@@ -3,7 +3,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
 from datetime import datetime, timedelta
 from collections import defaultdict
-import json
+import asyncio
 
 # Configuration
 BOT_TOKEN = "8597564579:AAGHr1Rqi8ZIqD_RA8PuslB1ob6bAjtOEhU"
@@ -20,49 +20,7 @@ PREMIUM_PLANS = {
 # Storage (in production, use a database)
 user_messages = defaultdict(lambda: {
     "count": 0, 
-    "date": def main():
-    """Start the bot"""
-    # For Render.com and other platforms - set up a simple HTTP server
-    import os
-    from threading import Thread
-    from http.server import HTTPServer, BaseHTTPRequestHandler
-    
-    class HealthCheckHandler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.send_header('Content-type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(b'Bot is running!')
-        
-        def log_message(self, format, *args):
-            pass  # Suppress logs
-    
-    # Start health check server on PORT (for Render.com)
-    port = int(os.environ.get('PORT', 10000))
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    health_thread = Thread(target=server.serve_forever, daemon=True)
-    health_thread.start()
-    logger.info(f"Health check server started on port {port}")
-    
-    # Start the bot
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    # Command handlers MUST come FIRST - ORDER IS CRITICAL!
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("status", status))
-    application.add_handler(CommandHandler("premium", premium_menu))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("test", test_command))
-    
-    # Callback handlers
-    application.add_handler(CallbackQueryHandler(handle_plan_selection, pattern="^buy_"))
-    application.add_handler(CallbackQueryHandler(handle_payment_confirmation, pattern="^(confirm|reject)_"))
-    
-    # Message handler MUST come LAST - catches everything else
-    application.add_handler(MessageHandler(
-        filters.ALL,
-        handle_group_message
-    )),
+    "date": None,
     "is_new_user": True,
     "joined_date": datetime.now()
 })
@@ -78,7 +36,6 @@ def is_premium(user_id):
         if datetime.now() < premium_users[user_id]["expires"]:
             return True
         else:
-            # Premium expired
             del premium_users[user_id]
     return False
 
@@ -86,16 +43,13 @@ def get_user_message_limit(user_id):
     """Get message limit for user based on their status"""
     user_data = user_messages[user_id]
     
-    # Check if it's user's first day
     if user_data["is_new_user"]:
         joined_date = user_data["joined_date"].date()
         today = datetime.now().date()
         
-        # If joined today, give 5 messages
         if joined_date == today:
             return NEW_USER_MESSAGE_LIMIT
         else:
-            # No longer a new user
             user_data["is_new_user"] = False
             return DAILY_MESSAGE_LIMIT
     
@@ -113,7 +67,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     premium_status = "✅ PREMIUM" if is_premium(user_id) else "🆓 FREE"
     
-    # Mark user as registered
     if user_id not in user_messages:
         user_messages[user_id]["joined_date"] = datetime.now()
         user_messages[user_id]["is_new_user"] = True
@@ -230,7 +183,6 @@ async def handle_plan_selection(update: Update, context: ContextTypes.DEFAULT_TY
         "timestamp": datetime.now()
     }
     
-    # Admin approval keyboard
     admin_keyboard = [
         [
             InlineKeyboardButton("✅ Confirm Payment", callback_data=f"confirm_{payment_id}"),
@@ -239,7 +191,6 @@ async def handle_plan_selection(update: Update, context: ContextTypes.DEFAULT_TY
     ]
     admin_markup = InlineKeyboardMarkup(admin_keyboard)
     
-    # Notify admin
     try:
         await context.bot.send_message(
             chat_id=ADMIN_USERNAME,
@@ -257,7 +208,6 @@ async def handle_plan_selection(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("❌ Error sending request. Please contact admin directly.")
         return
     
-    # Notify user
     await query.edit_message_text(
         f"💳 Payment Instructions\n\n"
         f"Plan: {plan_info['name']} Premium\n"
@@ -280,7 +230,6 @@ async def handle_payment_confirmation(update: Update, context: ContextTypes.DEFA
     query = update.callback_query
     await query.answer()
     
-    # Check if user is admin
     if query.from_user.username != ADMIN_USERNAME:
         await query.answer("⛔ Only admin can confirm payments!", show_alert=True)
         return
@@ -299,7 +248,6 @@ async def handle_payment_confirmation(update: Update, context: ContextTypes.DEFA
     amount = payment_info["amount"]
     
     if action == "confirm":
-        # Grant premium membership
         duration_days = PREMIUM_PLANS[plan]["duration_days"]
         expires = datetime.now() + timedelta(days=duration_days)
         
@@ -318,7 +266,6 @@ async def handle_payment_confirmation(update: Update, context: ContextTypes.DEFA
             f"Premium activated successfully! 🎉"
         )
         
-        # Notify user
         try:
             await context.bot.send_message(
                 chat_id=user_id,
@@ -332,14 +279,13 @@ async def handle_payment_confirmation(update: Update, context: ContextTypes.DEFA
         except Exception as e:
             logger.error(f"Error notifying user: {e}")
     
-    else:  # reject
+    else:
         await query.edit_message_text(
             f"❌ PAYMENT REJECTED\n\n"
             f"User: @{user_name}\n"
             f"Amount: ₹{amount}"
         )
         
-        # Notify user
         try:
             await context.bot.send_message(
                 chat_id=user_id,
@@ -388,9 +334,7 @@ async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     logger.info(f"Chat type: {chat_type}, User: {user_name}, User ID: {user_id}")
     
-    # Check if in group
     if chat_type in ["group", "supergroup"]:
-        # Check bot admin status
         try:
             bot_member = await context.bot.get_chat_member(update.effective_chat.id, context.bot.id)
             bot_status = bot_member.status
@@ -404,7 +348,6 @@ async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             admin_status = f"❌ Error checking status: {e}"
             logger.error(f"Error checking bot admin status: {e}")
         
-        # Check user status
         is_new = user_messages[user_id]["is_new_user"]
         limit = get_user_message_limit(user_id)
         
@@ -437,19 +380,15 @@ async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"3. Use /test in the group"
         )
 
-
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle messages in the group"""
-    # Debug logging
     logger.info(f"Received message: {update.message.text if update.message else 'No message'}")
     logger.info(f"Chat type: {update.effective_chat.type if update.effective_chat else 'No chat'}")
     
-    # Only process group messages
     if update.effective_chat.type not in ["group", "supergroup"]:
         logger.info("Not a group message, ignoring")
         return
     
-    # Ignore if no message or no text
     if not update.message or not update.message.text:
         logger.info("No message text, ignoring")
         return
@@ -460,16 +399,13 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     
     logger.info(f"Processing message from {user_name}: {message_text}")
     
-    # ONLY COUNT MESSAGES STARTING WITH /
     if not message_text.startswith('/'):
         logger.info("Message doesn't start with /, ignoring")
         return
     
-    # Extract command (first word)
     command = message_text.split()[0].lower()
     logger.info(f"Command extracted: {command}")
     
-    # Ignore ONLY bot management commands - count everything else
     bot_commands = ['/start', '/status', '/premium', '/help', '/test']
     if command in bot_commands:
         logger.info(f"Bot management command {command}, ignoring")
@@ -477,12 +413,10 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     
     logger.info(f"This command will be counted: {command}")
     
-    # Admin has unlimited messages
     if update.effective_user.username == ADMIN_USERNAME:
         logger.info("User is admin, unlimited access")
         return
     
-    # Check if bot is admin (needed to delete messages)
     try:
         bot_member = await context.bot.get_chat_member(update.effective_chat.id, context.bot.id)
         if bot_member.status not in ["administrator", "creator"]:
@@ -492,7 +426,6 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.error(f"Error checking bot admin status: {e}")
         return
     
-    # Premium users have unlimited messages
     if is_premium(user_id):
         logger.info(f"User {user_name} is premium")
         try:
@@ -501,30 +434,23 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 text=f"💎 @{user_name}: Premium Member - Unlimited searches!",
                 reply_to_message_id=update.message.message_id
             )
-            # Delete after 3 seconds using asyncio
-            import asyncio
             await asyncio.sleep(3)
             await premium_msg.delete()
         except Exception as e:
             logger.error(f"Error sending premium status: {e}")
         return
     
-    # Check and reset daily count for free users
     reset_daily_count(user_id)
-    
-    # Get user's message limit
     limit = get_user_message_limit(user_id)
     
     logger.info(f"User {user_name} count: {user_messages[user_id]['count']}/{limit}")
     
-    # Check message limit
     if user_messages[user_id]["count"] >= limit:
         is_new = user_messages[user_id]["is_new_user"]
         logger.info(f"User {user_name} exceeded limit, deleting message")
         try:
             await update.message.delete()
             
-            # Send notification in GROUP
             limit_msg = await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 text=f"⛔ @{user_name} - DAILY LIMIT REACHED\n\n"
@@ -535,22 +461,18 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 reply_to_message_id=None
             )
             
-            # Delete the notification after 10 seconds
-            import asyncio
             await asyncio.sleep(10)
             await limit_msg.delete()
         except Exception as e:
             logger.error(f"Error deleting message: {e}")
         return
     
-    # Increment counter
     user_messages[user_id]["count"] += 1
     remaining = limit - user_messages[user_id]["count"]
     is_new = user_messages[user_id]["is_new_user"]
     
     logger.info(f"Incremented count for {user_name}. New count: {user_messages[user_id]['count']}, Remaining: {remaining}")
     
-    # Show remaining messages after EVERY message
     try:
         if remaining > 0:
             status_msg = await context.bot.send_message(
@@ -561,13 +483,10 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             
             logger.info(f"Sent status message, will delete in 5 seconds")
-            # Delete status message after 5 seconds
-            import asyncio
             await asyncio.sleep(5)
             await status_msg.delete()
             logger.info("Status message deleted")
         else:
-            # Last message - warn about limit
             warning_msg = await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 text=f"⚠️ @{user_name}: This was your last search for today!\n"
@@ -576,8 +495,6 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 reply_to_message_id=update.message.message_id
             )
             
-            # Delete warning after 8 seconds
-            import asyncio
             await asyncio.sleep(8)
             await warning_msg.delete()
     except Exception as e:
@@ -585,7 +502,6 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 def main():
     """Start the bot"""
-    # For Render.com and other platforms - set up a simple HTTP server
     import os
     from threading import Thread
     from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -598,19 +514,17 @@ def main():
             self.wfile.write(b'Bot is running!')
         
         def log_message(self, format, *args):
-            pass  # Suppress logs
+            pass
     
-    # Start health check server on PORT (for Render.com)
     port = int(os.environ.get('PORT', 10000))
     server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
     health_thread = Thread(target=server.serve_forever, daemon=True)
     health_thread.start()
     logger.info(f"Health check server started on port {port}")
     
-    # Start the bot
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Command handlers
+    # Command handlers MUST come FIRST
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("premium", premium_menu))
@@ -621,14 +535,11 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_plan_selection, pattern="^buy_"))
     application.add_handler(CallbackQueryHandler(handle_payment_confirmation, pattern="^(confirm|reject)_"))
     
-    # Message handler for group messages (both group and supergroup)
-    # Use a simpler filter to catch ALL messages first
-    application.add_handler(MessageHandler(
-        filters.ALL,
-        handle_group_message
-    ))
+    # Message handler MUST come LAST
+    application.add_handler(MessageHandler(filters.ALL, handle_group_message))
     
     logger.info("🚀 Premium Membership Bot Started!")
+    logger.info(f"Handlers registered: {len(application.handlers[0])} handlers")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
