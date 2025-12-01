@@ -541,7 +541,7 @@ async def database_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'first_name': user.get('first_name'),
                 'registration_time': user.get('registration_time').isoformat() if user.get('registration_time') else None,
                 'is_new_user': user.get('is_new_user'),
-                'message_count': user.get('message_count')
+                'message_count': user.get('message_count'),
                 'last_reset': user.get('last_reset'),
                 'total_commands': user.get('total_commands', 0),
                 'current_premium': None,
