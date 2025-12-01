@@ -6,7 +6,7 @@ from collections import defaultdict
 import json
 
 # Configuration
-BOT_TOKEN = "8597564579:AAGBmsRfsuZljUV51jhQEw6_CLWm5CrYxaU"
+BOT_TOKEN = "8178740511:AAEv7r1qLoorgLXcxQoxLN8szd9vpU6ILFo"
 ADMIN_USERNAME = "itsmezigzagzozo"
 DAILY_MESSAGE_LIMIT = 1      # Regular users: 1 message per day
 NEW_USER_MESSAGE_LIMIT = 5   # New users: 5 messages on first day
@@ -75,17 +75,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in user_messages:
         user_messages[user_id]["joined_date"] = datetime.now()
         user_messages[user_id]["is_new_user"] = True
-        welcome_bonus = f"\n🎁 Welcome Bonus: {NEW_USER_MESSAGE_LIMIT} messages for today!"
+        welcome_bonus = f"\n🎁 Welcome Bonus: {NEW_USER_MESSAGE_LIMIT} searches for today!"
     else:
         welcome_bonus = ""
     
     await update.message.reply_text(
         f"👋 Welcome to the Premium Membership Bot!\n\n"
         f"Your Status: {premium_status}{welcome_bonus}\n\n"
+        f"🔍 Only messages starting with / are counted\n"
+        f"Examples: /num, /search, /find\n"
+        f"Regular chat is unlimited!\n\n"
         f"📊 Free Users:\n"
-        f"• New Users: {NEW_USER_MESSAGE_LIMIT} messages (first day only)\n"
-        f"• Regular Users: {DAILY_MESSAGE_LIMIT} message/day\n\n"
-        f"💎 Premium Users: Unlimited messages\n\n"
+        f"• New Users: {NEW_USER_MESSAGE_LIMIT} searches (first day only)\n"
+        f"• Regular Users: {DAILY_MESSAGE_LIMIT} search/day\n\n"
+        f"💎 Premium Users: Unlimited searches\n\n"
         f"💰 Premium Plans:\n"
         f"• Weekly: ₹300 (7 days)\n"
         f"• Monthly: ₹500 (30 days)\n\n"
@@ -310,12 +313,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show help message"""
     await update.message.reply_text(
         f"📚 BOT HELP\n\n"
+        f"🔍 Message Counting:\n"
+        f"• Only messages starting with / are counted\n"
+        f"• Examples: /num, /search, /find, etc.\n"
+        f"• Regular chat messages are NOT counted\n\n"
         f"🆓 Free Members:\n"
-        f"• New Users: {NEW_USER_MESSAGE_LIMIT} messages (first day only)\n"
-        f"• Regular Users: {DAILY_MESSAGE_LIMIT} message per day\n"
+        f"• New Users: {NEW_USER_MESSAGE_LIMIT} searches (first day only)\n"
+        f"• Regular Users: {DAILY_MESSAGE_LIMIT} search per day\n"
         f"• Resets daily at midnight\n\n"
         f"💎 Premium Members:\n"
-        f"• Unlimited messages\n"
+        f"• Unlimited searches\n"
         f"• No restrictions\n\n"
         f"💰 Premium Plans:\n"
         f"• Weekly: ₹300 (7 days)\n"
@@ -324,19 +331,91 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"/start - Start bot\n"
         f"/status - Check account\n"
         f"/premium - Buy premium\n"
-        f"/help - This message\n\n"
+        f"/help - This message\n"
+        f"/test - Test bot in group\n\n"
         f"Need help? Contact @{ADMIN_USERNAME}"
     )
 
+async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Test if bot is working in the group"""
+    chat_type = update.effective_chat.type
+    user_id = update.effective_user.id
+    user_name = update.effective_user.username or update.effective_user.first_name
+    
+    # Check if in group
+    if chat_type in ["group", "supergroup"]:
+        # Check bot admin status
+        try:
+            bot_member = await context.bot.get_chat_member(update.effective_chat.id, context.bot.id)
+            bot_status = bot_member.status
+            
+            if bot_status in ["administrator", "creator"]:
+                admin_status = "✅ Bot is Admin (Can delete messages)"
+            else:
+                admin_status = "❌ Bot is NOT Admin (Cannot delete messages)\n⚠️ Make bot admin with 'Delete Messages' permission!"
+        except Exception as e:
+            admin_status = f"❌ Error checking status: {e}"
+        
+        # Check user status
+        is_new = user_searches[user_id]["is_new_user"] if user_id in user_searches else user_messages[user_id]["is_new_user"]
+        limit = get_user_message_limit(user_id)
+        
+        await update.message.reply_text(
+            f"🤖 BOT STATUS TEST\n\n"
+            f"Chat Type: {chat_type}\n"
+            f"{admin_status}\n\n"
+            f"👤 Your Status:\n"
+            f"User: @{user_name}\n"
+            f"Type: {'🎁 New User' if is_new else '🆓 Regular User'}\n"
+            f"Daily Limit: {limit} message(s)\n"
+            f"Premium: {'✅ Yes' if is_premium(user_id) else '❌ No'}\n\n"
+            f"✅ Bot is working in this group!"
+        )
+    else:
+        await update.message.reply_text(
+            f"🤖 BOT TEST\n\n"
+            f"Chat Type: {chat_type} (Private Chat)\n\n"
+            f"ℹ️ To test in group:\n"
+            f"1. Add me to your group\n"
+            f"2. Make me admin with 'Delete Messages' permission\n"
+            f"3. Use /test in the group"
+        )
+
+
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle messages in the group"""
+    # Only process group messages
     if update.effective_chat.type not in ["group", "supergroup"]:
         return
     
+    # Ignore if no message or no text
+    if not update.message or not update.message.text:
+        return
+    
+    # ONLY COUNT MESSAGES STARTING WITH /
+    if not update.message.text.startswith('/'):
+        return
+    
+    # Ignore standard bot commands
+    standard_commands = ['/start', '/status', '/premium', '/help', '/test']
+    if any(update.message.text.lower().startswith(cmd) for cmd in standard_commands):
+        return
+    
     user_id = update.effective_user.id
+    user_name = update.effective_user.username or update.effective_user.first_name
     
     # Admin has unlimited messages
     if update.effective_user.username == ADMIN_USERNAME:
+        return
+    
+    # Check if bot is admin (needed to delete messages)
+    try:
+        bot_member = await context.bot.get_chat_member(update.effective_chat.id, context.bot.id)
+        if bot_member.status not in ["administrator", "creator"]:
+            logger.warning(f"Bot is not admin in chat {update.effective_chat.id}")
+            return
+    except Exception as e:
+        logger.error(f"Error checking bot admin status: {e}")
         return
     
     # Premium users have unlimited messages
@@ -354,15 +433,22 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         is_new = user_messages[user_id]["is_new_user"]
         try:
             await update.message.delete()
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"⛔ DAILY LIMIT REACHED\n\n"
+            
+            # Send notification in GROUP
+            limit_msg = await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"⛔ @{user_name} - DAILY LIMIT REACHED\n\n"
                      f"You've used {limit}/{limit} {'welcome bonus ' if is_new else ''}messages today.\n\n"
-                     f"💎 Upgrade to Premium for unlimited messages!\n\n"
-                     f"Plans:\n"
-                     f"• Weekly: ₹300\n"
-                     f"• Monthly: ₹500\n\n"
-                     f"Use /premium to upgrade now!"
+                     f"💎 Upgrade to Premium for unlimited searches!\n"
+                     f"Plans: Weekly ₹300 | Monthly ₹500\n\n"
+                     f"Use /premium to upgrade now!",
+                reply_to_message_id=None
+            )
+            
+            # Delete the notification after 10 seconds
+            await context.application.job_queue.run_once(
+                lambda _: limit_msg.delete(),
+                when=10
             )
         except Exception as e:
             logger.error(f"Error deleting message: {e}")
@@ -371,21 +457,39 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     # Increment counter
     user_messages[user_id]["count"] += 1
     remaining = limit - user_messages[user_id]["count"]
+    is_new = user_messages[user_id]["is_new_user"]
     
-    # Warn when approaching limit
-    if remaining <= 2 and remaining > 0:
-        is_new = user_messages[user_id]["is_new_user"]
-        try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"⚠️ WARNING\n\n"
-                     f"Only {remaining} message{'s' if remaining != 1 else ''} remaining today!\n"
-                     f"{'(Welcome bonus) ' if is_new else ''}\n\n"
-                     f"💎 Get Premium for unlimited messages\n"
-                     f"Use /premium to upgrade"
+    # Show remaining messages after EVERY message
+    try:
+        if remaining > 0:
+            status_msg = await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"📊 @{user_name}: {remaining}/{limit} message{'s' if remaining != 1 else ''} remaining today"
+                     f"{' (Welcome bonus)' if is_new else ''}",
+                reply_to_message_id=update.message.message_id
             )
-        except Exception as e:
-            logger.error(f"Error sending warning: {e}")
+            
+            # Delete status message after 5 seconds
+            await context.application.job_queue.run_once(
+                lambda _: status_msg.delete(),
+                when=5
+            )
+        else:
+            # Last message - warn about limit
+            warning_msg = await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"⚠️ @{user_name}: This was your last message for today!\n"
+                     f"💎 Upgrade to Premium: /premium",
+                reply_to_message_id=update.message.message_id
+            )
+            
+            # Delete warning after 8 seconds
+            await context.application.job_queue.run_once(
+                lambda _: warning_msg.delete(),
+                when=8
+            )
+    except Exception as e:
+        logger.error(f"Error sending status: {e}")
 
 def main():
     """Start the bot"""
@@ -419,14 +523,15 @@ def main():
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("premium", premium_menu))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("test", test_command))
     
     # Callback handlers
     application.add_handler(CallbackQueryHandler(handle_plan_selection, pattern="^buy_"))
     application.add_handler(CallbackQueryHandler(handle_payment_confirmation, pattern="^(confirm|reject)_"))
     
-    # Message handler for group messages
+    # Message handler for group messages (both group and supergroup)
     application.add_handler(MessageHandler(
-        filters.ChatType.GROUPS & ~filters.COMMAND,
+        (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP) & ~filters.COMMAND,
         handle_group_message
     ))
     
