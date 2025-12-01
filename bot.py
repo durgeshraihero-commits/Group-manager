@@ -490,8 +490,12 @@ def build_app():
     app.add_handler(CommandHandler("resync", resync_cmd))
 
     # Group message handler
-    app.add_handler(MessageHandler(filters.TEXT & (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUPS), handle_group))
-
+    app.add_handler(
+    MessageHandler(
+        filters.TEXT & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP),
+        handle_group
+    )
+                                       )
     return app
 
 # ---------------------------------------------------
