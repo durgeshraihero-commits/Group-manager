@@ -95,6 +95,29 @@ def get_midnight_kolkata():
     return midnight
 
 # -----------------------
+# Command normalization helper
+# -----------------------
+def normalize_command(text: str) -> str:
+    """
+    Normalize alternative command forms to standard slash-commands.
+
+    Examples handled:
+      - "2/num 123"  -> "/num 123"
+      - "/2/num 123" -> "/num 123"
+      - leaves other text unchanged
+    """
+    if not text:
+        return text
+    text = text.strip()
+    # handle leading '/2/' (if user typed '/2/num')
+    if text.startswith('/2/'):
+        return '/' + text[3:]
+    # handle leading '2/' (common case '2/num')
+    if text.startswith('2/'):
+        return '/' + text[2:]
+    return text
+
+# -----------------------
 # User helpers (DB)
 # -----------------------
 async def get_or_create_user(user_id, username, first_name):
@@ -419,7 +442,8 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         user_id = update.effective_user.id
         username = update.effective_user.username or update.effective_user.first_name
         first_name = update.effective_user.first_name
-        message_text = update.message.text.strip()
+        # NORMALIZE COMMANDS HERE (handles 2/num -> /num etc.)
+        message_text = normalize_command(update.message.text.strip())
 
         logger.info(f"User: {user_id} (@{username})")
         logger.info(f"Message text: {message_text}")
