@@ -41,14 +41,14 @@ MONGODB_DBNAME = os.environ.get('MONGODB_DBNAME', 'tg_bot_db')
 ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', 'itsmezigzagzozo')
 ADMIN_USER_ID = int(os.environ.get('ADMIN_USER_ID', '6314556756'))
 DAILY_MESSAGE_LIMIT = int(os.environ.get('DAILY_MESSAGE_LIMIT', '1'))
-NEW_USER_MESSAGE_LIMIT = int(os.environ.get('NEW_USER_MESSAGE_LIMIT', '5'))
+NEW_USER_MESSAGE_LIMIT = int(os.environ.get('NEW_USER_MESSAGE_LIMIT', '2'))
 PORT = int(os.environ.get('PORT', '10000'))
 
 KOLKATA_TZ = pytz.timezone('Asia/Kolkata')
 
 PREMIUM_PLANS = {
     "week": {"price": 300, "duration_days": 7, "name": "Weekly"},
-    "month": {"price": 500, "duration_days": 30, "name": "Monthly"}
+    "month": {"price": 800, "duration_days": 30, "name": "Monthly"}
 }
 
 # -----------------------
