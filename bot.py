@@ -207,7 +207,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔍 Only / commands counted\n\n"
         f"📊 Free: {NEW_USER_MESSAGE_LIMIT} (new) / {DAILY_MESSAGE_LIMIT} (regular)\n"
         f"💎 Premium: Unlimited\n\n"
-        f"Plans: Weekly ₹300 | Monthly ₹500\n\n"
+        f"Plans: Weekly ₹300 | Monthly ₹800\n\n"
         f"/status /premium /help"
     )
 
@@ -255,7 +255,7 @@ async def premium_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     keyboard = [
         [InlineKeyboardButton("📅 Weekly ₹300", callback_data="buy_week")],
-        [InlineKeyboardButton("📆 Monthly ₹500", callback_data="buy_month")],
+        [InlineKeyboardButton("📆 Monthly ₹800", callback_data="buy_month")],
         [InlineKeyboardButton("💬 Contact", url=f"https://t.me/{ADMIN_USERNAME}")]
     ]
     status_text = "💎 Premium Plans:\n\n"
@@ -267,7 +267,7 @@ async def premium_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             days_left = (expires.replace(tzinfo=KOLKATA_TZ) - get_kolkata_time()).days if isinstance(expires, datetime) else 0
             status_text = f"✅ Premium! Expires in {days_left} days\n\n"
     await update.message.reply_text(
-        f"{status_text}📅 Weekly: ₹300 (7 days)\n📆 Monthly: ₹500 (30 days)",
+        f"{status_text}📅 Weekly: ₹300 (7 days)\n📆 Monthly: ₹800 (30 days)",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
