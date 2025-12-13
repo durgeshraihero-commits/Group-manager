@@ -1,3 +1,4 @@
+
 # bot.py
 import logging
 import os
@@ -40,8 +41,6 @@ MONGODB_URI = os.environ.get('MONGODB_URI', 'mongodb+srv://prarthanaray147_db_us
 MONGODB_DBNAME = os.environ.get('MONGODB_DBNAME', 'tg_bot_db')
 ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', 'itsmezigzagzozo')
 ADMIN_USER_ID = int(os.environ.get('ADMIN_USER_ID', '6314556756'))
-DAILY_MESSAGE_LIMIT = int(os.environ.get('DAILY_MESSAGE_LIMIT', '0'))
-NEW_USER_MESSAGE_LIMIT = int(os.environ.get('NEW_USER_MESSAGE_LIMIT', '2'))
 PORT = int(os.environ.get('PORT', '10000'))
 
 KOLKATA_TZ = pytz.timezone('Asia/Kolkata')
@@ -89,11 +88,6 @@ async def init_mongodb():
 def get_kolkata_time():
     return datetime.now(KOLKATA_TZ)
 
-def get_midnight_kolkata():
-    now = get_kolkata_time()
-    midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    return midnight
-
 # -----------------------
 # Command normalization helper
 # -----------------------
@@ -129,9 +123,6 @@ async def get_or_create_user(user_id, username, first_name):
             'username': username,
             'first_name': first_name,
             'registration_time': now,
-            'is_new_user': True,
-            'message_count': 0,
-            'last_reset': now.date().isoformat(),
             'premium_history': [],
             'current_premium': None,
             'total_commands': 0
@@ -149,14 +140,6 @@ async def log_command(user_id, username, command, chat_id):
         await users_collection.update_one({'user_id': user_id}, {'$inc': {'total_commands': 1}})
     except Exception as e:
         logger.error(f"Failed to log command: {e}")
-
-async def reset_daily_count_if_needed(user_id):
-    user = await users_collection.find_one({'user_id': user_id})
-    if not user:
-        return
-    today = get_kolkata_time().date().isoformat()
-    if user.get('last_reset') != today:
-        await users_collection.update_one({'user_id': user_id}, {'$set': {'message_count': 0, 'last_reset': today, 'is_new_user': False}})
 
 async def is_premium(user_id):
     user = await users_collection.find_one({'user_id': user_id})
@@ -183,14 +166,6 @@ async def is_premium(user_id):
             return False
     return False
 
-async def get_user_message_limit(user_id):
-    user = await users_collection.find_one({'user_id': user_id})
-    if not user:
-        return DAILY_MESSAGE_LIMIT
-    if user.get('is_new_user', False):
-        return NEW_USER_MESSAGE_LIMIT
-    return DAILY_MESSAGE_LIMIT
-
 # -----------------------
 # Command handlers
 # -----------------------
@@ -198,15 +173,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     username = update.effective_user.username
     first_name = update.effective_user.first_name
-    user = await get_or_create_user(user_id, username, first_name)
+    await get_or_create_user(user_id, username, first_name)
     await update_user_info(user_id, username, first_name)
-    premium_status = "✅ PREMIUM" if await is_premium(user_id) else "🆓 FREE"
-    welcome_bonus = f"\n🎁 Welcome Bonus: {NEW_USER_MESSAGE_LIMIT} searches!" if user.get('is_new_user') else ""
+    premium_status = "✅ PREMIUM" if await is_premium(user_id) else "🔒 NO ACCESS"
     await update.message.reply_text(
-        f"👋 Welcome!\n\nStatus: {premium_status}{welcome_bonus}\n\n"
-        f"🔍 Only / commands counted\n\n"
-        f"📊 Free: {NEW_USER_MESSAGE_LIMIT} (new) / {DAILY_MESSAGE_LIMIT} (regular)\n"
-        f"💎 Premium: Unlimited\n\n"
+        f"👋 Welcome!\n\nStatus: {premium_status}\n\n"
+        f"💎 This bot requires Premium membership\n"
+        f"🔍 Premium = Unlimited searches\n\n"
         f"Plans: Weekly ₹300 | Monthly ₹800\n\n"
         f"/status /premium /help"
     )
@@ -216,8 +189,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = update.effective_user.username
     first_name = update.effective_user.first_name
     user = await get_or_create_user(user_id, username, first_name)
-    await reset_daily_count_if_needed(user_id)
     user = await users_collection.find_one({'user_id': user_id})
+    
     if await is_premium(user_id):
         premium = user.get('current_premium', {})
         expires = premium.get('expires')
@@ -229,25 +202,20 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if expires_kolkata:
                 days_left = (expires_kolkata - get_kolkata_time()).days
                 await update.message.reply_text(
-                    f"💎 PREMIUM\n\n"
+                    f"💎 PREMIUM ACTIVE\n\n"
                     f"Plan: {PREMIUM_PLANS.get(plan, {}).get('name', 'Custom')}\n"
                     f"Expires: {expires_kolkata.strftime('%Y-%m-%d %H:%M')} IST\n"
-                    f"Days: {days_left}\n"
-                    f"Commands: {user.get('total_commands', 0)}\n\n"
+                    f"Days Left: {days_left}\n"
+                    f"Total Commands: {user.get('total_commands', 0)}\n\n"
+                    f"✅ Unlimited Searches\n\n"
                     f"/premium to renew"
                 )
                 return
-    count = user.get('message_count', 0)
-    limit = await get_user_message_limit(user_id)
-    remaining = limit - count
-    user_type = "NEW 🎁" if user.get('is_new_user') else "FREE"
-    midnight = get_midnight_kolkata()
+    
     await update.message.reply_text(
-        f"🆓 {user_type}\n\n"
-        f"Used: {count}/{limit}\n"
-        f"Remaining: {remaining}\n"
-        f"Resets: {midnight.strftime('%H:%M')} IST\n"
-        f"Commands: {user.get('total_commands', 0)}\n\n"
+        f"🔒 NO PREMIUM ACCESS\n\n"
+        f"Total Commands: {user.get('total_commands', 0)}\n\n"
+        f"💎 Subscribe to Premium for unlimited searches!\n\n"
         f"/premium to upgrade"
     )
 
@@ -265,9 +233,9 @@ async def premium_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         expires = premium.get('expires')
         if expires:
             days_left = (expires.replace(tzinfo=KOLKATA_TZ) - get_kolkata_time()).days if isinstance(expires, datetime) else 0
-            status_text = f"✅ Premium! Expires in {days_left} days\n\n"
+            status_text = f"✅ Premium Active! Expires in {days_left} days\n\n"
     await update.message.reply_text(
-        f"{status_text}📅 Weekly: ₹300 (7 days)\n📆 Monthly: ₹800 (30 days)",
+        f"{status_text}📅 Weekly: ₹300 (7 days)\n📆 Monthly: ₹800 (30 days)\n\n✅ Unlimited searches",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
@@ -352,7 +320,7 @@ async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         premium_record = {'plan': plan, 'expires': expires, 'activated': get_kolkata_time(), 'amount': 0, 'duration_days': days, 'approved_by_admin': True}
         user = await users_collection.find_one({'user_id': target_user_id})
         if not user:
-            await users_collection.insert_one({'user_id': target_user_id, 'username': None, 'first_name': None, 'registration_time': get_kolkata_time(), 'is_new_user': False, 'message_count': 0, 'last_reset': get_kolkata_time().date().isoformat(), 'premium_history': [premium_record], 'current_premium': premium_record, 'total_commands': 0})
+            await users_collection.insert_one({'user_id': target_user_id, 'username': None, 'first_name': None, 'registration_time': get_kolkata_time(), 'premium_history': [premium_record], 'current_premium': premium_record, 'total_commands': 0})
         else:
             await users_collection.update_one({'user_id': target_user_id}, {'$set': {'current_premium': premium_record}, '$push': {'premium_history': premium_record}})
         await update.message.reply_text(f"✅ APPROVED\n\nID: {target_user_id}\nDays: {days}")
@@ -378,9 +346,6 @@ async def database_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'username': user.get('username'),
                 'first_name': user.get('first_name'),
                 'registration_time': user.get('registration_time').isoformat() if user.get('registration_time') else None,
-                'is_new_user': user.get('is_new_user'),
-                'message_count': user.get('message_count'),
-                'last_reset': user.get('last_reset'),
                 'total_commands': user.get('total_commands', 0),
                 'current_premium': None,
                 'premium_history': []
@@ -413,10 +378,11 @@ async def database_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"📚 HELP\n\n"
-        f"Only / commands counted\n"
-        f"Free: {NEW_USER_MESSAGE_LIMIT} (new) / {DAILY_MESSAGE_LIMIT} (regular)\n"
-        f"Resets: midnight IST\n"
-        f"Blocked until midnight if exceeded\n\n"
+        f"💎 Premium membership required to use commands\n"
+        f"✅ Premium = Unlimited searches\n\n"
+        f"Plans:\n"
+        f"📅 Weekly: ₹300 (7 days)\n"
+        f"📆 Monthly: ₹800 (30 days)\n\n"
         f"/start /status /premium /help\n\n"
         f"Contact: @{ADMIN_USERNAME}"
     )
@@ -488,11 +454,12 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await log_command(user_id, username, command, update.effective_chat.id)
         logger.info("Command logged successfully!")
 
-        # Premium check
+        # Premium check - ONLY premium users can use commands
         is_premium_user = await is_premium(user_id)
         logger.info(f"Premium status: {is_premium_user}")
+        
         if is_premium_user:
-            logger.info("User is premium, announcing in group")
+            logger.info("User is premium, allowing command")
             try:
                 await context.bot.send_message(
                     chat_id=update.effective_chat.id,
@@ -502,72 +469,32 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
             except Exception as e:
                 logger.error(f"Failed to send premium msg: {e}")
             return
-
-        # Reset daily count if needed
-        logger.info("Resetting daily count if needed...")
-        await reset_daily_count_if_needed(user_id)
-
-        user = await users_collection.find_one({'user_id': user_id})
-        limit = await get_user_message_limit(user_id)
-        count = user.get('message_count', 0)
-        logger.info(f"User count: {count}/{limit}")
-
-        if count >= limit:
-            logger.info("LIMIT EXCEEDED! Will block user until midnight.")
-            midnight = get_midnight_kolkata()
-            try:
-                if can_delete:
-                    try:
-                        await update.message.delete()
-                        logger.info("User message deleted")
-                    except Exception as e:
-                        logger.error(f"Failed to delete message: {e}")
-                else:
-                    logger.info("Skipping deletion due to missing permission.")
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=f"⛔ @{username} - BLOCKED UNTIL MIDNIGHT\n\n"
-                         f"You've used {limit}/{limit} searches today.\n"
-                         f"You cannot send ANY commands until midnight.\n\n"
-                         f"🕐 Resets at: {midnight.strftime('%H:%M')} IST\n\n"
-                         f"💎 Upgrade to Premium for unlimited searches!\n"
-                         f"Use /premium to upgrade now!",
-                )
-                logger.info("Block notification sent!")
-            except Exception as e:
-                logger.error(f"Error blocking user: {e}")
-            return
-
-        # Increment user's message count
-        logger.info("Incrementing message count...")
+        
+        # Non-premium user - block command
+        logger.info("NON-PREMIUM USER - BLOCKING COMMAND")
         try:
-            await users_collection.update_one({'user_id': user_id}, {'$inc': {'message_count': 1}})
-            logger.info("Count incremented!")
-        except Exception as e:
-            logger.error(f"Failed to increment count: {e}")
-
-        remaining = limit - (count + 1)
-        is_new = user.get('is_new_user', False)
-        logger.info(f"Remaining after increment: {remaining}")
-
-        try:
-            if remaining > 0:
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=f"📊 @{username}: {remaining}/{limit} search{'es' if remaining != 1 else ''} remaining today{' 🎁' if is_new else ''}",
-                    reply_to_message_id=update.message.message_id
-                )
+            if can_delete:
+                try:
+                    await update.message.delete()
+                    logger.info("User message deleted")
+                except Exception as e:
+                    logger.error(f"Failed to delete message: {e}")
             else:
-                midnight = get_midnight_kolkata()
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=f"⚠️ @{username}: This was your last search for today!\n"
-                         f"Next command will be blocked until {midnight.strftime('%H:%M')} IST.\n"
-                         f"💎 Upgrade to Premium: /premium",
-                    reply_to_message_id=update.message.message_id
-                )
+                logger.info("Skipping deletion due to missing permission.")
+            
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"🔒 @{username} - PREMIUM REQUIRED\n\n"
+                     f"This bot requires Premium membership to use commands.\n\n"
+                     f"💎 Subscribe to Premium for unlimited searches!\n\n"
+                     f"Plans:\n"
+                     f"📅 Weekly: ₹300 (7 days)\n"
+                     f"📆 Monthly: ₹800 (30 days)\n\n"
+                     f"Use /premium to subscribe now!",
+            )
+            logger.info("Block notification sent!")
         except Exception as e:
-            logger.error(f"Failed to send status/warning: {e}")
+            logger.error(f"Error blocking user: {e}")
 
     except Exception as e:
         logger.error(f"CRITICAL ERROR in handle_group_message: {e}", exc_info=True)
